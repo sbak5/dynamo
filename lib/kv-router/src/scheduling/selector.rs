@@ -179,7 +179,7 @@ impl fmt::Display for CandidatesSummary<'_> {
 /// The cost function's structure, as a fixed string -- logged once per
 /// selector (see `DefaultWorkerSelector::new`) rather than repeated on every
 /// decision. Field names here match the `CandidateScore`/`CandidatesSummary`
-/// argument names used in every "Routing decision" log, so the two are meant
+/// argument names used in every "Selected worker" log, so the two are meant
 /// to be read together: this says what the formula IS, those say what
 /// arguments were plugged into it for a specific request/candidate.
 const FORMULA_DESCRIPTION: &str = "logit = prefill_load_scale * max(raw_prefill_blocks - overlap_credit_blocks, 0) + decode_cost_blocks; \
@@ -424,7 +424,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 active_prefill_tokens = score.active_prefill_tokens,
                 active_decode_blocks = score.active_decode_blocks,
                 effective_cached_blocks = effective_overlap_blocks,
-                "Routing decision"
+                "Selected pinned worker"
             );
 
             return Ok(WorkerSelectionResult {
@@ -545,6 +545,9 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 request_id = request.mode.request_id().unwrap_or("unknown"),
                 session_id = request.session_id.as_deref().unwrap_or(""),
                 router_mode = "kv",
+                worker_id = best_worker.worker_id,
+                dp_rank = ?best_worker.dp_rank,
+                logit = best_score.logit,
                 worker_type = %self.worker_type,
                 isl_tokens = request.isl_tokens,
                 num_candidates,
@@ -563,7 +566,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 host_pinned_blocks = best_host_pinned_overlap_blocks,
                 disk_blocks = best_disk_overlap_blocks,
                 candidates = %CandidatesSummary(&candidates),
-                "Routing decision"
+                "Selected worker"
             );
             let effective_overlap_blocks = request.effective_overlap_blocks_for(best_worker);
             let cached_tokens = request.effective_cached_tokens_for(best_worker);
@@ -587,6 +590,9 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             request_id = request.mode.request_id().unwrap_or("unknown"),
                 session_id = request.session_id.as_deref().unwrap_or(""),
             router_mode = "kv",
+            worker_id = best_worker.worker_id,
+            dp_rank = ?best_worker.dp_rank,
+            logit = best_score.logit,
             worker_type = %self.worker_type,
             isl_tokens = request.isl_tokens,
             num_candidates,
@@ -607,7 +613,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             disk_blocks = best_disk_overlap_blocks,
             total_kv_blocks = ?total_kv_blocks,
             candidates = %CandidatesSummary(&candidates),
-            "Routing decision"
+            "Selected worker"
         );
 
         Ok(WorkerSelectionResult {
@@ -673,6 +679,7 @@ mod tests {
             priority_jump: 0.0,
             strict_priority: 0,
             policy_class: None,
+            session_id: None,
             expected_output_tokens: None,
             pinned_worker: None,
             allowed_worker_ids: None,
@@ -840,6 +847,7 @@ mod tests {
             priority_jump: 0.0,
             strict_priority: 0,
             policy_class: None,
+            session_id: None,
             expected_output_tokens: None,
             pinned_worker: None,
             allowed_worker_ids: None,
@@ -983,6 +991,7 @@ mod tests {
             priority_jump: 0.0,
             strict_priority: 0,
             policy_class: None,
+            session_id: None,
             expected_output_tokens: None,
             pinned_worker: None,
             allowed_worker_ids: None,
@@ -1033,6 +1042,7 @@ mod tests {
             priority_jump: 0.0,
             strict_priority: 0,
             policy_class: None,
+            session_id: None,
             expected_output_tokens: None,
             pinned_worker: None,
             allowed_worker_ids: None,
@@ -1101,6 +1111,7 @@ mod tests {
                 priority_jump: 0.0,
                 strict_priority: 0,
                 policy_class: None,
+                session_id: None,
                 expected_output_tokens: None,
                 pinned_worker: None,
                 allowed_worker_ids: None,
@@ -1167,6 +1178,7 @@ mod tests {
             priority_jump: 0.0,
             strict_priority: 0,
             policy_class: None,
+            session_id: None,
             expected_output_tokens: None,
             pinned_worker: None,
             allowed_worker_ids: None,
@@ -1229,6 +1241,7 @@ mod tests {
             priority_jump: 0.0,
             strict_priority: 0,
             policy_class: None,
+            session_id: None,
             expected_output_tokens: None,
             pinned_worker: None,
             allowed_worker_ids: None,
@@ -1307,6 +1320,7 @@ mod tests {
             priority_jump: 0.0,
             strict_priority: 0,
             policy_class: None,
+            session_id: None,
             expected_output_tokens: None,
             pinned_worker: None,
             allowed_worker_ids: None,
@@ -1376,6 +1390,7 @@ mod tests {
             priority_jump: 0.0,
             strict_priority: 0,
             policy_class: None,
+            session_id: None,
             expected_output_tokens: None,
             pinned_worker: None,
             allowed_worker_ids: None,
@@ -1396,6 +1411,105 @@ mod tests {
 
     #[test]
     fn test_worker_logit_preserves_prefill_accounting_edges() {
+        let worker = WorkerWithDpRank::from_worker_id(0);
+        let mut request = base_request(64);
+        request.overlap.effective_cached_tokens.insert(worker, 96);
+        request.overlap.tier_overlap_blocks.device.insert(worker, 6);
+        request.worker_loads.insert(
+            worker,
+            crate::sequences::WorkerLoadProjection {
+                active_prefill_tokens: 16,
+                active_decode_blocks: 2,
+                additional_active_blocks: 3,
+            },
+        );
+        let selector = DefaultWorkerSelector::new(Some(KvRouterConfig::default()), "test");
+        let weights = LogitWeights {
+            overlap_score_credit: 1.0,
+            overlap_score_credit_decay: 0.0,
+            prefill_load_scale: 2.0,
+            shared_cache_multiplier: 0.0,
+        };
+
+        assert_eq!(
+            selector
+                .worker_logit(&request, worker, 16, 0, weights)
+                .logit,
+            7.0
+        );
+
+        request.track_prefill_tokens = false;
+        assert_eq!(
+            selector
+                .worker_logit(&request, worker, 16, 0, weights)
+                .logit,
+            -7.0
+        );
+    }
+
+    #[test]
+    fn test_overlap_credit_above_one_can_prefer_colocated_worker() {
+        use crate::test_utils::SimpleWorkerConfig;
+
+        let block_size = 16u32;
+        let warm_worker = WorkerWithDpRank::from_worker_id(0);
+        let cold_worker = WorkerWithDpRank::from_worker_id(1);
+        let workers = HashMap::from([
+            (warm_worker.worker_id, SimpleWorkerConfig::default()),
+            (cold_worker.worker_id, SimpleWorkerConfig::default()),
+        ]);
+
+        let mut request = base_request(64);
+        request
+            .overlap
+            .tier_overlap_blocks
+            .device
+            .insert(warm_worker, 4);
+        request
+            .overlap
+            .effective_cached_tokens
+            .insert(warm_worker, 64);
+        request.worker_loads.insert(
+            warm_worker,
+            crate::sequences::WorkerLoadProjection {
+                active_decode_blocks: 5,
+                ..Default::default()
+            },
+        );
+
+        let normal_credit = DefaultWorkerSelector::new(
+            Some(KvRouterConfig {
+                overlap_score_credit: 1.0,
+                ..Default::default()
+            }),
+            "test",
+        );
+        let amplified_credit = DefaultWorkerSelector::new(
+            Some(KvRouterConfig {
+                overlap_score_credit: 1.5,
+                ..Default::default()
+            }),
+            "test",
+        );
+
+        assert_eq!(
+            normal_credit
+                .select_worker(&workers, &request, request.eligibility(), block_size)
+                .unwrap()
+                .worker,
+            cold_worker
+        );
+        assert_eq!(
+            amplified_credit
+                .select_worker(&workers, &request, request.eligibility(), block_size)
+                .unwrap()
+                .worker,
+            warm_worker
+        );
+    }
+
+    #[test]
+    fn test_worker_logit_does_not_clamp_negative_prefill_cost() {
         let worker = WorkerWithDpRank::from_worker_id(0);
         let mut request = base_request(64);
         request.overlap.effective_cached_tokens.insert(worker, 96);
@@ -1539,6 +1653,7 @@ mod tests {
             priority_jump: 0.0,
             strict_priority: 0,
             policy_class: None,
+            session_id: None,
             expected_output_tokens: None,
             pinned_worker: None,
             allowed_worker_ids: None,
@@ -1593,6 +1708,7 @@ mod tests {
             priority_jump: 0.0,
             strict_priority: 0,
             policy_class: None,
+            session_id: None,
             expected_output_tokens: None,
             pinned_worker: None,
             allowed_worker_ids: None,
