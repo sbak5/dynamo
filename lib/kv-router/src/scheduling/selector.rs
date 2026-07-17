@@ -407,6 +407,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
 
             tracing::info!(
                 request_id = request.mode.request_id().unwrap_or("unknown"),
+                session_id = request.session_id.as_deref().unwrap_or(""),
                 router_mode = "kv",
                 worker_type = %self.worker_type,
                 isl_tokens = request.isl_tokens,
@@ -542,6 +543,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
         if self.worker_type == "decode" {
             tracing::info!(
                 request_id = request.mode.request_id().unwrap_or("unknown"),
+                session_id = request.session_id.as_deref().unwrap_or(""),
                 router_mode = "kv",
                 worker_type = %self.worker_type,
                 isl_tokens = request.isl_tokens,
@@ -583,6 +585,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
 
         tracing::info!(
             request_id = request.mode.request_id().unwrap_or("unknown"),
+                session_id = request.session_id.as_deref().unwrap_or(""),
             router_mode = "kv",
             worker_type = %self.worker_type,
             isl_tokens = request.isl_tokens,
