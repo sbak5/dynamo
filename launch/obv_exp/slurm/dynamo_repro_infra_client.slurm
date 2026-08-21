@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=dynamo-repro-infra-client
-#SBATCH --partition=h100x4_aarch64
+#SBATCH --account=nemotron_sw_resiliency
+#SBATCH --partition=cpu
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --time=01:00:00
@@ -53,12 +54,12 @@
 
 set -euo pipefail
 
-IMAGE="${IMAGE:-nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1}"
+IMAGE="${IMAGE:-/lustre/fs1/portfolios/coreai/projects/coreai_resiliency_osiris/users/sbak/containers/dynamo-vllm-runtime-1.3.0.sqsh}"
 export MODEL="${MODEL:-Qwen/Qwen2.5-7B-Instruct}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 
-BASE_DIR="${HOME}/dynamo_repro"
-SCRATCH_ARCHIVE="/home/scratch.sbak_coreai/dynamo_repro/archived-runs"
+BASE_DIR="$(realpath "${HOME}/lustre")/dynamo_repro"
+SCRATCH_ARCHIVE="${BASE_DIR}/archived-runs"
 RUN_DIR="${BASE_DIR}/runs/${RUN_ID}"
 SHARED="${SHARED:-${RUN_DIR}/shared}"
 export LOGDIR="${LOGDIR:-${RUN_DIR}/logs}"
@@ -80,7 +81,7 @@ archive_old_runs_if_needed() {
     done
   fi
 }
-archive_old_runs_if_needed
+# Keep all runs on the shared Lustre filesystem; no archive/staging step is needed.
 
 mkdir -p "$SHARED" "$LOGDIR"
 
@@ -89,6 +90,7 @@ mkdir -p "$SHARED" "$LOGDIR"
 # resolve via the container's environment, which need not match the host
 # path used for --container-mounts.
 export HOST_HOME="$HOME"
+export LUSTRE_MOUNT="$(realpath "$HOME/lustre")"
 
 # Matches dynamo_repro_build_wheel.slurm's WHEELHOUSE_NAME -- lets two
 # builds (e.g. "baseline" vs "latest") coexist under $HOME for A/B
@@ -108,7 +110,7 @@ export NATS_SERVER="nats://${INFRA_IP}:4222"
 # needs escaping against the outer script — values cross over as exported
 # env vars instead.
 srun --container-image="$IMAGE" \
-     --container-mounts="${HOST_HOME}:${HOST_HOME}" \
+     --container-mounts="${HOST_HOME}:${HOST_HOME},${LUSTRE_MOUNT}:${LUSTRE_MOUNT}" \
      --export=ALL,ETCD_ENDPOINTS,NATS_SERVER,MODEL,INFRA_IP,LOGDIR,HOST_HOME,WHEELHOUSE_NAME \
      bash -s <<'INNER'
 set -euo pipefail

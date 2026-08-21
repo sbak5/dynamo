@@ -1,6 +1,7 @@
 #!/bin/bash
 #SBATCH --job-name=dynamo-repro-role-4gpu
-#SBATCH --partition=gb200nvl72
+#SBATCH --account=nemotron_sw_resiliency
+#SBATCH --partition=batch
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus-per-node=4
@@ -30,7 +31,7 @@
 
 set -euo pipefail
 
-IMAGE="${IMAGE:-nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1}"
+IMAGE="${IMAGE:-nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.3.0}"
 export MODEL="${MODEL:-Qwen/Qwen2.5-7B-Instruct}"
 export NUM_GPUS_PER_NODE="${NUM_GPUS_PER_NODE:-4}"
 RUN_ID="${RUN_ID:?RUN_ID must be set to the same value used for dynamo_repro_infra_client.slurm}"
@@ -46,6 +47,7 @@ mkdir -p "$LOGDIR"
 # is single-quoted, so it resolves via the container's environment unless
 # passed through --export).
 export HOST_HOME="$HOME"
+export LUSTRE_MOUNT="$(realpath "$HOME/lustre")"
 
 # Matches dynamo_repro_build_wheel.slurm's WHEELHOUSE_NAME / job A's
 # WHEELHOUSE_NAME -- must agree with job A so frontend and workers run the
@@ -84,7 +86,7 @@ export OTEL_TRACES_SAMPLE_RATIO=1.0
 # This cluster otherwise applies a five-minute default to the nested step even
 # though the Slurm allocation has a one-hour limit.
 srun --time=01:00:00 --container-image="$IMAGE" \
-     --container-mounts="${HOST_HOME}:${HOST_HOME}" \
+     --container-mounts="${HOST_HOME}:${HOST_HOME},${LUSTRE_MOUNT}:${LUSTRE_MOUNT}" \
      --export=ALL,ETCD_ENDPOINTS,NATS_SERVER,MODEL,NUM_GPUS_PER_NODE,ROLE,INFRA_IP,LOGDIR,HOST_HOME,WHEELHOUSE_NAME,VLLM_MAX_MODEL_LEN,OTEL_EXPORT_ENABLED,DYN_LOGGING_JSONL,OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,OTEL_EXPORTER_OTLP_TRACES_PROTOCOL,OTEL_EXPORTER_OTLP_TRACES_INSECURE,OTEL_TRACES_SAMPLE_RATIO \
      bash -s <<'INNER'
 set -euo pipefail

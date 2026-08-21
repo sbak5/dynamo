@@ -1,10 +1,10 @@
 #!/bin/bash
 #SBATCH --job-name=dynamo-repro-infra-client-fpm
-#SBATCH --partition=general
+#SBATCH --account=nemotron_sw_resiliency
+#SBATCH --partition=cpu
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --gpus=0
-#SBATCH --nodelist=ipp2-0037
 #SBATCH --time=02:00:00
 #
 # Reproducer, job A of 2: etcd + NATS + Tempo + 2 Dynamo frontend replicas +
@@ -58,7 +58,7 @@
 
 set -euo pipefail
 
-IMAGE="${IMAGE:-nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.2.1}"
+IMAGE="${IMAGE:-nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.3.0}"
 export MODEL="${MODEL:-Qwen/Qwen2.5-7B-Instruct}"
 RUN_ID="${RUN_ID:-$(date +%Y%m%d_%H%M%S)}"
 
@@ -81,6 +81,7 @@ rm -f "$SHARED/stop_workers" "$SHARED/prefill_workers_done" "$SHARED/decode_work
 # resolve via the container's environment, which need not match the host
 # path used for --container-mounts.
 export HOST_HOME="$HOME"
+export LUSTRE_MOUNT="$(realpath "$HOME/lustre")"
 # AIPerf's per-request profile JSONL can be large for the production workload.
 # Frontend/client jobs run on ipp nodes, so spool these artifacts directly to
 # scratch during the run and merge them into the completed run's logs/ at
@@ -172,7 +173,7 @@ until curl -sf "http://localhost:3200/ready" >/dev/null 2>&1; do sleep 1; done
 # needs escaping against the outer script — values cross over as exported
 # env vars instead.
 srun --container-image="$IMAGE" \
-     --container-mounts="${HOST_HOME}:${HOST_HOME},${IPP_SCRATCH}:${IPP_SCRATCH}" \
+     --container-mounts="${HOST_HOME}:${HOST_HOME},${LUSTRE_MOUNT}:${LUSTRE_MOUNT},${IPP_SCRATCH}:${IPP_SCRATCH}" \
      --export=ALL,ETCD_ENDPOINTS,NATS_SERVER,MODEL,INFRA_IP,LOGDIR,HOST_HOME,HF_HUB_CACHE,WHEELHOUSE_NAME,ROUTER_MODE,ROUTER_SESSION_AFFINITY_TTL_SECS,CLIENT_SESSION_HEADER,AIPERF_VERSION,AIPERF_CLIENT_SITE,CLIENT_WORKLOAD,AGENTX_DATASET,AGENTX_MAX_CONTEXT_LENGTH,AGENTX_DURATION,CLIENT_CONCURRENCY,SHARED,WAIT_FOR_PAGE_SIZE,AIPERF_ARTIFACT_ROOT,OTEL_EXPORT_ENABLED,DYN_LOGGING_JSONL,OTEL_EXPORTER_OTLP_TRACES_ENDPOINT,OTEL_EXPORTER_OTLP_TRACES_PROTOCOL,OTEL_EXPORTER_OTLP_TRACES_INSECURE,OTEL_TRACES_SAMPLE_RATIO \
      bash -s <<'INNER'
 set -euo pipefail
@@ -442,7 +443,7 @@ EOF
 # Tempo remains live while the dashboard performs its one-time exact request-ID
 # scrape.  Its JSON cache is then staged with the rest of the run.
 srun --overlap --nodes=1 --ntasks=1 --container-image="$IMAGE" \
-  --container-mounts="${HOST_HOME}:${HOST_HOME},/home/scratch.sbak_coreai:/home/scratch.sbak_coreai" \
+  --container-mounts="${HOST_HOME}:${HOST_HOME},${LUSTRE_MOUNT}:${LUSTRE_MOUNT},/home/scratch.sbak_coreai:/home/scratch.sbak_coreai" \
   python /home/scratch.sbak_coreai/dynamo-benchmark-perf-dashboard/dashboard.py "$DEST/dashboard.yaml" \
   > "$DEST/dashboard-build.log" 2>&1 || echo "[repro-A] dashboard build failed; raw sources retained" >&2
 printf 'run_id=%s\nstaged_at_utc=%s\nsource=%s\n' "$RUN_ID" "$(date -u +%FT%TZ)" "$RUN_DIR" > "$DEST/STAGED.txt"
