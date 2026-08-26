@@ -1,0 +1,28 @@
+# OTLP receiver for the lifecycle mock. The file exporter writes one JSON
+# record per export batch, making the resulting file JSONL.
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+processors:
+  batch: {}
+exporters:
+  file/traces:
+    path: __OTEL_TRACES_FILE__
+  file/logs:
+    path: __OTEL_LOGS_FILE__
+service:
+  extensions: [health_check]
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [file/traces]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [file/logs]
