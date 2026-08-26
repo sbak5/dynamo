@@ -24,6 +24,7 @@ use axum::{
 use base64::Engine as _;
 use bytes::Bytes;
 use dynamo_runtime::config::{env_is_truthy, environment_names::llm as env_llm};
+use dynamo_runtime::telemetry::{LifecycleStage, LifecycleTrace};
 use dynamo_runtime::{
     pipeline::{AsyncEngineContextProvider, Context},
     protocols::annotated::AnnotationsProvider,
@@ -1831,8 +1832,19 @@ async fn handler_chat_completions(
     )
     .await;
 
-    let response =
-        tokio::spawn(chat_completions(state, template, request, stream_handle).in_current_span())
+    let lifecycle = LifecycleTrace::from_environment();
+    let request_lifecycle = lifecycle.start(LifecycleStage::RequestLifecycle);
+    let response = tokio::spawn(
+        chat_completions(
+            state,
+            template,
+            request,
+            stream_handle,
+            lifecycle,
+            request_lifecycle.clone(),
+        )
+        .instrument(request_lifecycle),
+    )
             .await
             .map_err(|e| {
                 ErrorMessage::internal_server_error_with_details(
@@ -2345,6 +2357,8 @@ async fn chat_completions(
     template: Option<RequestTemplate>,
     mut request: Context<NvCreateChatCompletionRequest>,
     mut stream_handle: ConnectionHandle,
+    lifecycle: LifecycleTrace,
+    request_lifecycle: tracing::Span,
 ) -> Result<Response, ErrorResponse> {
     // return a 503 if the service is not ready
     check_ready(&state)?;
@@ -2576,6 +2590,18 @@ async fn chat_completions(
             }
         };
         let stream = monitor_for_disconnects(stream, ctx, inflight_guard, stream_handle);
+        let response_streaming = {
+            let _entered_request_lifecycle = request_lifecycle.enter();
+            lifecycle.start(LifecycleStage::ResponseStreaming)
+        };
+        let stream = async_stream::stream! {
+            let _request_lifecycle = request_lifecycle;
+            let _response_streaming = response_streaming;
+            let mut inner = Box::pin(stream);
+            while let Some(item) = inner.next().await {
+                yield item;
+            }
+        };
 
         let mut sse_stream = Sse::new(stream);
 
@@ -2607,6 +2633,7 @@ async fn chat_completions(
 
         let response =
             NvCreateChatCompletionResponse::from_annotated_stream(stream, parsing_options.clone())
+                .instrument(lifecycle.start(LifecycleStage::ResponseStreaming))
                 .await
                 .map_err(|e| {
                     tracing::error!(

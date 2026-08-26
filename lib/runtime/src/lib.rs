@@ -45,6 +45,7 @@ pub mod service;
 pub mod slug;
 pub mod storage;
 pub mod system_health;
+pub mod telemetry;
 pub mod traits;
 pub mod transports;
 pub mod utils;

@@ -30,6 +30,7 @@ use dynamo_protocols::types::{
 };
 use dynamo_renderer::OAIPromptFormatter;
 use dynamo_runtime::config::is_truthy;
+use dynamo_runtime::telemetry::{LifecycleStage, LifecycleTrace};
 use dynamo_runtime::error::{DynamoError, ErrorType};
 use either::Either;
 use futures::Stream;
@@ -43,7 +44,7 @@ use dynamo_runtime::metrics::frontend_perf::{
     StageGuard, TEMPLATE_SECONDS, TOKENIZE_SECONDS,
 };
 use std::{any::Any, collections::HashMap, pin::Pin, sync::Arc};
-use tracing;
+use tracing::{self, Instrument};
 
 #[cfg(feature = "mm-routing")]
 use crate::model_card::ModelInfoType;
@@ -3689,6 +3690,9 @@ impl
         // unpack the request
         let (mut request, context) = request.into_parts();
 
+        let lifecycle = LifecycleTrace::from_environment();
+        let preprocessing = lifecycle.start(LifecycleStage::RequestPreprocessing);
+
         // Preserve original inbound streaming flag before any internal overrides
         let request_id = context.id().to_string();
         let original_stream_flag = request.inner.stream.unwrap_or(false);
@@ -3751,6 +3755,7 @@ impl
                     .flatten()
                     .map(|name| name.as_ref().clone()),
             )
+            .instrument(preprocessing.clone())
             .await?;
         attach_agent_context_from_context(&mut common_request, &context);
 
@@ -3794,6 +3799,8 @@ impl
             .flat_map(|(k, v)| Annotated::from_annotation(k, &v))
             .collect();
         let annotations_stream = stream::iter(annotations);
+
+        drop(preprocessing);
 
         // forward the common completion request to the next operator
         let response_stream = next.generate(common_request).await?;
