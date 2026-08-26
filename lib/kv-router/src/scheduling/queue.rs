@@ -11,6 +11,8 @@ use crossbeam_queue::SegQueue;
 use rustc_hash::FxHashSet;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
+#[cfg(feature = "runtime-protocols")]
+use dynamo_runtime::telemetry::{LifecycleStage, LifecycleTrace};
 
 use super::config::RouterQueuePolicy;
 use super::filter::RoutingEligibility;
@@ -56,6 +58,10 @@ pub struct ClassQueueStats {
 
 struct QueuedRequest {
     request: SchedulingRequest,
+    /// Request context captured by the sender and restored when this request
+    /// is admitted by the long-lived scheduler actor.
+    parent_span: tracing::Span,
+    lifecycle_span: tracing::Span,
     enqueue_at: Instant,
     block_hashes: Option<Vec<LocalBlockHash>>,
     admission: Option<RequestAdmission>,
@@ -71,6 +77,9 @@ enum AdmissionCommand {
     Enqueue {
         request: SchedulingRequest,
         block_hashes: Option<Vec<LocalBlockHash>>,
+        /// `tracing` task-local context does not cross the admission channel.
+        /// Preserve it so router lifecycle stages remain in the request trace.
+        parent_span: tracing::Span,
         lease: Option<Box<RequestLifecycleLease>>,
         ack_tx: oneshot::Sender<Option<Box<RequestLifecycleLease>>>,
     },
@@ -549,6 +558,7 @@ impl<
         let command = AdmissionCommand::Enqueue {
             request,
             block_hashes: self.prepare_block_hashes_for_refresh(block_hashes),
+            parent_span: tracing::Span::current(),
             lease,
             ack_tx,
         };
@@ -697,6 +707,7 @@ impl<
                 AdmissionCommand::Enqueue {
                     request,
                     block_hashes,
+                    parent_span,
                     mut lease,
                     ack_tx,
                 } => {
@@ -704,7 +715,7 @@ impl<
                         .as_ref()
                         .and_then(|_| request.mode.tracked_request_id().map(str::to_owned));
                     let (enqueue_ready, owns_lifecycle) =
-                        self.handle_enqueue(request, block_hashes);
+                        self.handle_enqueue(request, block_hashes, parent_span);
                     if let Some(lease) = lease.as_mut()
                         && owns_lifecycle
                     {
@@ -767,7 +778,9 @@ impl<
                 .pending_cached_tokens
                 .fetch_sub(snapshot.cached_tokens, AtomicOrdering::Relaxed);
 
-            let mut request = entry.into_payload().request;
+            let queued = entry.into_payload();
+            drop(queued.lifecycle_span);
+            let mut request = queued.request;
             request.respond(Err(KvSchedulerError::SubscriberShutdown));
         }
     }
@@ -776,6 +789,7 @@ impl<
         &mut self,
         mut request: SchedulingRequest,
         block_hashes: Option<Vec<LocalBlockHash>>,
+        parent_span: tracing::Span,
     ) -> (bool, bool) {
         let decay_now = Instant::now();
         // Synthetic and explicit selections avoid cache work. Family classification
@@ -886,11 +900,13 @@ impl<
                 self.all_workers_prefill_busy(class, request.eligibility(), decay_now)
             });
         if !should_queue {
-            return self.admit_one(
-                request,
-                decay_now,
-                admission.map(|(admission, _)| admission),
-            );
+            return parent_span.in_scope(|| {
+                self.admit_one(
+                    request,
+                    decay_now,
+                    admission.map(|(admission, _)| admission),
+                )
+            });
         }
 
         let snapshot = snapshot.unwrap_or_else(|| self.snapshot_for(&request));
@@ -914,11 +930,18 @@ impl<
                 admission.ticket,
             )
         });
+        #[cfg(feature = "runtime-protocols")]
+        let lifecycle_span = parent_span
+            .in_scope(|| LifecycleTrace::from_environment().start(LifecycleStage::RouterQueue));
+        #[cfg(not(feature = "runtime-protocols"))]
+        let lifecycle_span = tracing::Span::none();
         let queued = QueuedRequest {
             request,
+            parent_span,
             enqueue_at: decay_now,
             block_hashes,
             admission: admission.map(|(admission, _)| admission),
+            lifecycle_span,
         };
         let worker_count = self.workers_with_configs.borrow().len();
         let enqueue = match deferred_id {
@@ -944,6 +967,7 @@ impl<
             ),
         };
         if let Err((rejection, queued)) = enqueue {
+            drop(queued.lifecycle_span);
             let made_ready = queued
                 .admission
                 .as_ref()
@@ -1384,14 +1408,19 @@ impl<
             let admit_now = Instant::now();
             let class_index = popped.class_index();
             let class = self.profile.class(class_index);
-            let queued = popped.into_payload();
-            let admission = queued.admission;
-            let request = queued.request;
+            let QueuedRequest {
+                request,
+                parent_span,
+                admission,
+                lifecycle_span,
+                ..
+            } = popped.into_payload();
+            drop(lifecycle_span);
             tracing::debug!(
                 policy_class = class.name,
                 "scheduling request from pending queue"
             );
-            let _ = self.admit_one(request, admit_now, admission);
+            let _ = parent_span.in_scope(|| self.admit_one(request, admit_now, admission));
         }
     }
 
@@ -1414,6 +1443,12 @@ impl<
             .slots
             .project_worker_loads(request.token_seq.as_deref(), decay_now);
 
+        #[cfg(feature = "runtime-protocols")]
+        let lifecycle_span =
+            LifecycleTrace::from_environment().start(LifecycleStage::RouterSelection);
+        #[cfg(not(feature = "runtime-protocols"))]
+        let lifecycle_span = tracing::Span::none();
+
         let selection = {
             let workers = self.workers_with_configs.borrow();
             let overloaded_worker_ids = self
@@ -1433,6 +1468,8 @@ impl<
                     (selection, selected_worker_tiers)
                 })
         };
+
+        drop(lifecycle_span);
 
         let (selection, selected_worker_tiers) = match selection {
             Ok(s) => s,
