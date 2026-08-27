@@ -30,7 +30,7 @@ use dynamo_protocols::types::{
 };
 use dynamo_renderer::OAIPromptFormatter;
 use dynamo_runtime::config::is_truthy;
-use dynamo_runtime::telemetry::{LifecycleStage, LifecycleTrace};
+use dynamo_runtime::telemetry::{LIFECYCLE_TRACE_CONTEXT_KEY, LifecycleStage, LifecycleTrace};
 use dynamo_runtime::error::{DynamoError, ErrorType};
 use either::Either;
 use futures::Stream;
@@ -3690,7 +3690,12 @@ impl
         // unpack the request
         let (mut request, context) = request.into_parts();
 
-        let lifecycle = LifecycleTrace::from_environment();
+        let lifecycle = context
+            .get_optional::<LifecycleTrace>(LIFECYCLE_TRACE_CONTEXT_KEY)
+            .ok()
+            .flatten()
+            .map(|trace| trace.as_ref().clone())
+            .unwrap_or_else(|| LifecycleTrace::from_request_id(context.id().to_string()));
         let preprocessing = lifecycle.start(LifecycleStage::RequestPreprocessing);
 
         // Preserve original inbound streaming flag before any internal overrides

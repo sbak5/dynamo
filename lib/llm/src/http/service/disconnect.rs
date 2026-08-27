@@ -29,7 +29,10 @@
 //!
 
 use axum::response::sse::Event;
-use dynamo_runtime::engine::AsyncEngineContext;
+use dynamo_runtime::{
+    engine::AsyncEngineContext,
+    telemetry::{LifecycleTerminal, TerminalOutcome},
+};
 use futures::{Stream, StreamExt};
 use std::sync::Arc;
 use std::time::Duration;
@@ -121,6 +124,32 @@ pub async fn create_connection_monitor(
     metrics: Option<Arc<Metrics>>,
     cancellation_labels: CancellationLabels,
 ) -> (ConnectionHandle, ConnectionHandle) {
+    create_connection_monitor_inner(engine_context, metrics, cancellation_labels, None).await
+}
+
+/// Creates connection monitors that also complete a request-lifecycle terminal
+/// outcome if the HTTP connection or SSE body is dropped unexpectedly.
+pub async fn create_connection_monitor_with_terminal(
+    engine_context: Arc<dyn AsyncEngineContext>,
+    metrics: Option<Arc<Metrics>>,
+    cancellation_labels: CancellationLabels,
+    terminal: LifecycleTerminal,
+) -> (ConnectionHandle, ConnectionHandle) {
+    create_connection_monitor_inner(
+        engine_context,
+        metrics,
+        cancellation_labels,
+        Some(terminal),
+    )
+    .await
+}
+
+async fn create_connection_monitor_inner(
+    engine_context: Arc<dyn AsyncEngineContext>,
+    metrics: Option<Arc<Metrics>>,
+    cancellation_labels: CancellationLabels,
+    terminal: Option<LifecycleTerminal>,
+) -> (ConnectionHandle, ConnectionHandle) {
     // these oneshot channels monitor possible disconnects from the client in two different scopes:
     // - the local task (connection_handle)
     // - an optionally streaming response (stream_handle)
@@ -134,6 +163,7 @@ pub async fn create_connection_monitor(
         stream_rx,
         metrics,
         cancellation_labels,
+        terminal,
     ));
 
     // Two handles, the first is armed, the second is disarmed
@@ -150,6 +180,7 @@ async fn connection_monitor(
     stream_rx: tokio::sync::oneshot::Receiver<ConnectionStatus>,
     metrics: Option<Arc<Metrics>>,
     cancellation_labels: CancellationLabels,
+    terminal: Option<LifecycleTerminal>,
 ) {
     match connection_rx.await {
         Err(_) | Ok(ConnectionStatus::ClosedUnexpectedly) => {
@@ -158,6 +189,9 @@ async fn connection_monitor(
             if let Some(metrics) = &metrics {
                 metrics.inc_client_disconnect();
                 metrics.inc_cancellation(&cancellation_labels);
+            }
+            if let Some(terminal) = &terminal {
+                terminal.finish(TerminalOutcome::Cancelled);
             }
             engine_context.kill();
         }
@@ -173,6 +207,9 @@ async fn connection_monitor(
             if let Some(metrics) = &metrics {
                 metrics.inc_client_disconnect();
                 metrics.inc_cancellation(&cancellation_labels);
+            }
+            if let Some(terminal) = &terminal {
+                terminal.finish(TerminalOutcome::Cancelled);
             }
             engine_context.kill();
         }
@@ -208,12 +245,49 @@ pub fn monitor_for_disconnects(
     )
 }
 
+/// Like [`monitor_for_disconnects`], while recording stream-terminal outcomes
+/// on a lifecycle request root.
+pub fn monitor_for_disconnects_with_terminal(
+    stream: impl Stream<Item = Result<Event, axum::Error>>,
+    context: Arc<dyn AsyncEngineContext>,
+    inflight_guard: InflightGuard,
+    stream_handle: ConnectionHandle,
+    terminal: LifecycleTerminal,
+) -> impl Stream<Item = Result<Event, axum::Error>> {
+    monitor_for_disconnects_with_timeout_inner(
+        stream,
+        context,
+        inflight_guard,
+        stream_handle,
+        backend_stream_timeout(),
+        Some(terminal),
+    )
+}
+
 fn monitor_for_disconnects_with_timeout(
+    stream: impl Stream<Item = Result<Event, axum::Error>>,
+    context: Arc<dyn AsyncEngineContext>,
+    inflight_guard: InflightGuard,
+    stream_handle: ConnectionHandle,
+    inactivity_timeout: Option<Duration>,
+) -> impl Stream<Item = Result<Event, axum::Error>> {
+    monitor_for_disconnects_with_timeout_inner(
+        stream,
+        context,
+        inflight_guard,
+        stream_handle,
+        inactivity_timeout,
+        None,
+    )
+}
+
+fn monitor_for_disconnects_with_timeout_inner(
     stream: impl Stream<Item = Result<Event, axum::Error>>,
     context: Arc<dyn AsyncEngineContext>,
     mut inflight_guard: InflightGuard,
     mut stream_handle: ConnectionHandle,
     inactivity_timeout: Option<Duration>,
+    terminal: Option<LifecycleTerminal>,
 ) -> impl Stream<Item = Result<Event, axum::Error>> {
     stream_handle.arm();
 
@@ -238,6 +312,9 @@ fn monitor_for_disconnects_with_timeout(
                         Some(Err(err)) => {
                             // Mark error as internal since it's a streaming error
                             inflight_guard.mark_error(ErrorType::Internal);
+                            if let Some(terminal) = &terminal {
+                                terminal.finish(TerminalOutcome::Failed);
+                            }
                             // We're terminating the stream intentionally here with a
                             // structured error + [DONE]; disarm so the stream handle
                             // doesn't later record this as ClosedUnexpectedly (which
@@ -276,6 +353,9 @@ fn monitor_for_disconnects_with_timeout(
                 _ = &mut stopped => {
                     // Mark as cancelled when context is stopped (client disconnect or timeout)
                     inflight_guard.mark_error(ErrorType::Cancelled);
+                    if let Some(terminal) = &terminal {
+                        terminal.finish(TerminalOutcome::Cancelled);
+                    }
                     // Token counts (input_tokens, output_tokens) are recorded on
                     // the enclosing span by ResponseMetricCollector::Drop.
                     tracing::warn!(
@@ -303,6 +383,9 @@ fn monitor_for_disconnects_with_timeout(
                 } => {
                     inflight_guard.mark_error(ErrorType::ResponseTimeout);
                     stream_handle.disarm();
+                    if let Some(terminal) = &terminal {
+                        terminal.finish(TerminalOutcome::TimedOut);
+                    }
                     tracing::warn!(
                         request_id = %inflight_guard.request_id(),
                         model = %inflight_guard.model(),
