@@ -931,8 +931,14 @@ impl<
             )
         });
         #[cfg(feature = "runtime-protocols")]
-        let lifecycle_span = parent_span
-            .in_scope(|| LifecycleTrace::from_environment().start(LifecycleStage::RouterQueue));
+        let lifecycle_span = parent_span.in_scope(|| {
+            request
+                .mode
+                .request_id()
+                .map(LifecycleTrace::router_request)
+                .unwrap_or_else(LifecycleTrace::from_environment)
+                .start(LifecycleStage::RouterQueue)
+        });
         #[cfg(not(feature = "runtime-protocols"))]
         let lifecycle_span = tracing::Span::none();
         let queued = QueuedRequest {
@@ -1444,8 +1450,12 @@ impl<
             .project_worker_loads(request.token_seq.as_deref(), decay_now);
 
         #[cfg(feature = "runtime-protocols")]
-        let lifecycle_span =
-            LifecycleTrace::from_environment().start(LifecycleStage::RouterSelection);
+        let lifecycle_span = request
+            .mode
+            .request_id()
+            .map(LifecycleTrace::router_request)
+            .unwrap_or_else(LifecycleTrace::from_environment)
+            .start(LifecycleStage::RouterSelection);
         #[cfg(not(feature = "runtime-protocols"))]
         let lifecycle_span = tracing::Span::none();
 

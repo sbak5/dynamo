@@ -24,7 +24,9 @@ use axum::{
 use base64::Engine as _;
 use bytes::Bytes;
 use dynamo_runtime::config::{env_is_truthy, environment_names::llm as env_llm};
-use dynamo_runtime::telemetry::{LifecycleStage, LifecycleTrace};
+use dynamo_runtime::telemetry::{
+    LIFECYCLE_TRACE_CONTEXT_KEY, LifecycleStage, LifecycleTerminal, LifecycleTrace, TerminalOutcome,
+};
 use dynamo_runtime::{
     pipeline::{AsyncEngineContextProvider, Context},
     protocols::annotated::AnnotationsProvider,
@@ -34,7 +36,10 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 
 use super::{
     RouteDoc,
-    disconnect::{ConnectionHandle, create_connection_monitor, monitor_for_disconnects},
+    disconnect::{
+        ConnectionHandle, create_connection_monitor, create_connection_monitor_with_terminal,
+        monitor_for_disconnects, monitor_for_disconnects_with_terminal,
+    },
     error::{HttpError, invalid_argument},
     metadata::{attach_x_request_id, extract_metadata_from_http},
     metrics::{
@@ -121,6 +126,14 @@ pub(super) fn get_body_limit() -> usize {
 }
 
 pub type ErrorResponse = (StatusCode, Json<ErrorMessage>);
+
+fn terminal_outcome_for_error_response(response: &ErrorResponse) -> TerminalOutcome {
+    if response.0.is_client_error() {
+        TerminalOutcome::Rejected
+    } else {
+        TerminalOutcome::Failed
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug)]
 pub(crate) struct ErrorMessage {
@@ -871,7 +884,7 @@ async fn completions_single(
                 // Transpose Result<Option<T>> -> Option<Result<T>>
                 future::ready(result.transpose())
             });
-        let stream = monitor_for_disconnects(stream, ctx, inflight_guard, stream_handle);
+        let stream = monitor_for_disconnects(stream, ctx.clone(), inflight_guard, stream_handle);
 
         let mut sse_stream = Sse::new(stream);
 
@@ -1815,7 +1828,7 @@ async fn handler_chat_completions(
         endpoint: Endpoint::ChatCompletions.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
-    let mut request = context_from_headers(request, request_id, &headers)?;
+    let mut request = context_from_headers(request, request_id.clone(), &headers)?;
     if let Some(captured) = crate::request_trace::payload::capture_http_headers(&headers) {
         request.insert(
             crate::request_trace::payload::HTTP_HEADERS_CONTEXT_KEY,
@@ -1824,17 +1837,28 @@ async fn handler_chat_completions(
     }
     let context = request.context();
 
-    // create the connection handles
-    let (mut connection_handle, stream_handle) = create_connection_monitor(
+    let session_id = request
+        .get_optional::<AgentContext>(AGENT_CONTEXT_CONTEXT_KEY)
+        .ok()
+        .flatten()
+        .map(|context| context.session_id.clone());
+    let lifecycle = LifecycleTrace::frontend_request(request_id.clone(), session_id);
+    request.insert(LIFECYCLE_TRACE_CONTEXT_KEY, lifecycle.clone());
+    let lifecycle_request = lifecycle.start_request();
+    let request_lifecycle = lifecycle_request.span();
+    let terminal = lifecycle_request.terminal();
+
+    // The monitor owns the reliable client-disconnect signal. Give it the
+    // terminal recorder before handing the streaming body to Axum, because an
+    // abruptly dropped SSE body never reaches the response stream's epilogue.
+    let (mut connection_handle, stream_handle) = create_connection_monitor_with_terminal(
         context.clone(),
         Some(state.metrics_clone()),
         cancellation_labels,
+        terminal.clone(),
     )
     .await;
-
-    let lifecycle = LifecycleTrace::from_environment();
-    let request_lifecycle = lifecycle.start(LifecycleStage::RequestLifecycle);
-    let response = tokio::spawn(
+    let response = match tokio::spawn(
         chat_completions(
             state,
             template,
@@ -1842,16 +1866,26 @@ async fn handler_chat_completions(
             stream_handle,
             lifecycle,
             request_lifecycle.clone(),
+            terminal.clone(),
         )
         .instrument(request_lifecycle),
     )
-            .await
-            .map_err(|e| {
-                ErrorMessage::internal_server_error_with_details(
-                    "Failed to await chat completions task",
-                    format!("{e:?}"),
-                )
-            })?;
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => {
+            terminal.finish(TerminalOutcome::Failed);
+            connection_handle.disarm();
+            return Err(ErrorMessage::internal_server_error_with_details(
+                "Failed to await chat completions task",
+                format!("{error:?}"),
+            ));
+        }
+    };
+
+    if let Err(error_response) = &response {
+        terminal.finish(terminal_outcome_for_error_response(error_response));
+    }
 
     // if we got here, then we will return a response and the potentially long running task has completed successfully
     // without need to be cancelled.
@@ -2359,6 +2393,7 @@ async fn chat_completions(
     mut stream_handle: ConnectionHandle,
     lifecycle: LifecycleTrace,
     request_lifecycle: tracing::Span,
+    terminal: LifecycleTerminal,
 ) -> Result<Response, ErrorResponse> {
     // return a 503 if the service is not ready
     check_ready(&state)?;
@@ -2478,6 +2513,12 @@ async fn chat_completions(
 
     // issue the generate call on the engine
     let stream = engine.generate(request).await.map_err(|e| {
+        // A request-plane timeout is reported by the runtime as a typed
+        // ResponseTimeout. Preserve that semantic terminal state before the
+        // error is converted into the public HTTP error response.
+        if super::metrics::request_was_timed_out(e.as_ref()) {
+            terminal.finish(TerminalOutcome::TimedOut);
+        }
         if super::metrics::request_was_rejected(e.as_ref()) {
             state
                 .metrics_clone()
@@ -2589,17 +2630,29 @@ async fn chat_completions(
                 }
             }
         };
-        let stream = monitor_for_disconnects(stream, ctx, inflight_guard, stream_handle);
+        let stream = monitor_for_disconnects_with_terminal(
+            stream,
+            ctx.clone(),
+            inflight_guard,
+            stream_handle,
+            terminal.clone(),
+        );
         let response_streaming = {
             let _entered_request_lifecycle = request_lifecycle.enter();
             lifecycle.start(LifecycleStage::ResponseStreaming)
         };
+        let terminal = terminal.clone();
         let stream = async_stream::stream! {
             let _request_lifecycle = request_lifecycle;
             let _response_streaming = response_streaming;
             let mut inner = Box::pin(stream);
             while let Some(item) = inner.next().await {
                 yield item;
+            }
+            if ctx.is_killed() {
+                terminal.finish(TerminalOutcome::Cancelled);
+            } else {
+                terminal.finish(TerminalOutcome::Success);
             }
         };
 
@@ -2653,6 +2706,9 @@ async fn chat_completions(
         // assembled but never delivered. Override to cancelled.
         if ctx.is_killed() {
             inflight_guard.mark_error(ErrorType::Cancelled);
+            terminal.finish(TerminalOutcome::Cancelled);
+        } else {
+            terminal.finish(TerminalOutcome::Success);
         }
         Ok(Json(response).into_response())
     }
