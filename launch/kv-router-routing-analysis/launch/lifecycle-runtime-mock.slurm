@@ -27,6 +27,14 @@ WHEELHOUSE_NAME="${WHEELHOUSE_NAME:-vllm-1.4.1-aarch64}"
 RUN_ID="${RUN_ID:-lifecycle_mock_$(date +%Y%m%d_%H%M%S)}"
 MODEL_NAME="${MODEL_NAME:-lifecycle-mocker}"
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3-0.6B}"
+# Comma-separated, opt-in terminal-path probes: `rejected`, `timed_out`,
+# `stream_error`, and/or `cancelled`. The legacy `failed` selector aliases
+# `rejected` for compatibility with the original mock probe.
+# The normal successful streaming request always runs first.
+LIFECYCLE_TEST_CASES="${LIFECYCLE_TEST_CASES:-}"
+LIFECYCLE_CANCEL_MAX_TIME_SECS="${LIFECYCLE_CANCEL_MAX_TIME_SECS:-0.25}"
+MOCKER_SPEEDUP_RATIO="${MOCKER_SPEEDUP_RATIO:-100}"
+FRONTEND_OTEL_FLUSH_DELAY_SECS="${FRONTEND_OTEL_FLUSH_DELAY_SECS:-6}"
 HOST_HOME="$HOME"
 RUN_DIR="$HOST_HOME/dynamo_repro/lifecycle_mock_runs/$RUN_ID"
 LOGDIR="$RUN_DIR/logs"
@@ -38,6 +46,12 @@ OTEL_LOGS_FILE="$LOGDIR/otel-logs.jsonl"
 mkdir -p "$LOGDIR"
 
 export IMAGE WHEELHOUSE_NAME RUN_ID MODEL_NAME MODEL_PATH HOST_HOME RUN_DIR LOGDIR
+export LIFECYCLE_TEST_CASES LIFECYCLE_CANCEL_MAX_TIME_SECS MOCKER_SPEEDUP_RATIO
+export FRONTEND_OTEL_FLUSH_DELAY_SECS
+export DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS="${DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS:-}"
+# The `timed_out` probe pauses a worker before its first response, exercising
+# the request-plane timeout rather than the post-SSE inactivity monitor.
+export DYN_TCP_REQUEST_TIMEOUT="${DYN_TCP_REQUEST_TIMEOUT:-5}"
 export DYN_LIFECYCLE_TRACE_ENABLED="${DYN_LIFECYCLE_TRACE_ENABLED:-true}"
 export DYN_LOGGING_SPAN_EVENTS="${DYN_LOGGING_SPAN_EVENTS:-true}"
 export OTEL_EXPORT_ENABLED="${OTEL_EXPORT_ENABLED:-true}"
@@ -82,6 +96,9 @@ done
 export OTEL_EXPORTER_OTLP_TRACES_ENDPOINT="http://$INFRA_IP:4317"
 echo "[lifecycle-mock] OTel Collector pid=$OTELCOL_PID otlp=$OTEL_EXPORTER_OTLP_TRACES_ENDPOINT traces=$OTEL_TRACES_FILE"
 
+# Preserve collector flush/staging even when an injected fault deliberately
+# makes the inner test fail. The final exit status still reflects that test.
+set +e
 srun --nodes=1 --ntasks=1 --container-image="$IMAGE" \
   --container-mounts="$HOST_HOME:$HOST_HOME" --container-remap-root --export=ALL \
   bash -s <<'INNER'
@@ -109,6 +126,8 @@ trap cleanup EXIT INT TERM
 export ETCD_ENDPOINTS="http://127.0.0.1:2379"
 export NATS_SERVER="nats://127.0.0.1:4222"
 export DYN_LIFECYCLE_TRACE_ENABLED DYN_LOGGING_SPAN_EVENTS
+export DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS
+export DYN_TCP_REQUEST_TIMEOUT
 export OTEL_EXPORT_ENABLED OTEL_EXPORTER_OTLP_TRACES_ENDPOINT OTEL_EXPORTER_OTLP_TRACES_PROTOCOL
 export OTEL_EXPORTER_OTLP_TRACES_INSECURE OTEL_TRACES_SAMPLE_RATIO
 
@@ -124,7 +143,7 @@ python3 -m dynamo.frontend --http-port 8000 --router-mode round-robin \
 FRONTEND_PID=$!
 
 python3 -m dynamo.mocker --model-name "$MODEL_NAME" --model-path "$MODEL_PATH" \
-  --speedup-ratio 100 --request-plane tcp >"$STAGING_LOGDIR/mocker.log" 2>&1 &
+  --speedup-ratio "$MOCKER_SPEEDUP_RATIO" --request-plane tcp >"$STAGING_LOGDIR/mocker.log" 2>&1 &
 MOCKER_PID=$!
 
 for _ in $(seq 1 90); do
@@ -147,8 +166,116 @@ curl --fail --silent --show-error --no-buffer \
   >"$STAGING_LOGDIR/response.jsonl"
 
 grep -q 'data:' "$STAGING_LOGDIR/response.jsonl"
+
+# An unknown model reaches the frontend request lifecycle but is rejected
+# before a backend response is delivered. It exercises the `rejected` path.
+case ",$LIFECYCLE_TEST_CASES," in
+  *,rejected,*|*,failed,*)
+    rejection_status=$(curl --silent --show-error --output "$STAGING_LOGDIR/rejected-response.json" \
+      --write-out '%{http_code}' \
+      -H 'content-type: application/json' \
+      http://127.0.0.1:8000/v1/chat/completions \
+      -d '{"model":"lifecycle-missing-model","messages":[{"role":"user","content":"fail"}],"max_tokens":4,"stream":false}')
+    case "$rejection_status" in
+      4*) echo "[lifecycle-mock] injected rejected request: HTTP $rejection_status" ;;
+      *) echo "expected injected rejection, got HTTP $rejection_status" >&2; exit 1 ;;
+    esac
+    ;;
+esac
+
+# Stop an already registered worker before issuing a valid request. Its listener
+# stays open but produces no first response, so the typed TCP request timeout is
+# the authoritative cause of terminal `timed_out`.
+case ",$LIFECYCLE_TEST_CASES," in
+  *,timed_out,*)
+    case "${DYN_TCP_REQUEST_TIMEOUT:-}" in
+      ""|0) echo "timed_out probe requires DYN_TCP_REQUEST_TIMEOUT>0" >&2; exit 1 ;;
+    esac
+    kill -STOP "$MOCKER_PID"
+    set +e
+    curl --silent --show-error --no-buffer --max-time 8 \
+      -H 'content-type: application/json' \
+      http://127.0.0.1:8000/v1/chat/completions \
+      -d "{\"model\":\"$MODEL_NAME\",\"messages\":[{\"role\":\"user\",\"content\":\"timeout\"}],\"max_tokens\":4,\"stream\":true}" \
+      >"$STAGING_LOGDIR/timed-out-response.jsonl"
+    timeout_rc=$?
+    set -e
+    kill -CONT "$MOCKER_PID"
+    [ "$timeout_rc" -ne 28 ] || {
+      echo "frontend inactivity timeout did not close the request" >&2
+      exit 1
+    }
+    sleep 1
+    echo "[lifecycle-mock] injected timed-out request"
+    ;;
+esac
+
+# A deliberately short-lived streaming client disconnects while a long mock
+# response is in flight. Slow the mock with MOCKER_SPEEDUP_RATIO when needed.
+case ",$LIFECYCLE_TEST_CASES," in
+  *,cancelled,*)
+    set +e
+    curl --silent --show-error --no-buffer --max-time "$LIFECYCLE_CANCEL_MAX_TIME_SECS" \
+      -H 'content-type: application/json' \
+      http://127.0.0.1:8000/v1/chat/completions \
+      -d "{\"model\":\"$MODEL_NAME\",\"messages\":[{\"role\":\"user\",\"content\":\"cancel\"}],\"max_tokens\":4096,\"stream\":true}" \
+      >"$STAGING_LOGDIR/cancelled-response.jsonl"
+    cancel_rc=$?
+    set -e
+    # Very fast mockers can complete before the client deadline. Treat that as
+    # an inconclusive cancellation probe rather than aborting unrelated
+    # terminal-case validation; the cancellation-specific run uses a slower
+    # backend configuration.
+    if [ "$cancel_rc" -ne 28 ]; then
+      echo "[lifecycle-mock] cancellation probe completed before client deadline (curl rc=$cancel_rc)" >&2
+    fi
+    # Allow the frontend disconnect monitor to observe the closed client.
+    sleep 2
+    echo "[lifecycle-mock] injected cancelled request"
+    ;;
+esac
+
+# Kill the worker after the first visible SSE chunk. This preserves HTTP 200 and
+# exercises a genuine backend stream error rather than a request-start failure.
+case ",$LIFECYCLE_TEST_CASES," in
+  *,stream_error,*)
+    curl --silent --show-error --no-buffer \
+      -H 'content-type: application/json' \
+      http://127.0.0.1:8000/v1/chat/completions \
+      -d "{\"model\":\"$MODEL_NAME\",\"messages\":[{\"role\":\"user\",\"content\":\"stream error\"}],\"max_tokens\":4096,\"stream\":true}" \
+      >"$STAGING_LOGDIR/stream-error-response.jsonl" &
+    stream_error_curl_pid=$!
+    for _ in $(seq 1 100); do
+      grep -q 'data:' "$STAGING_LOGDIR/stream-error-response.jsonl" 2>/dev/null && break
+      kill -0 "$stream_error_curl_pid" 2>/dev/null || break
+      sleep 0.05
+    done
+    grep -q 'data:' "$STAGING_LOGDIR/stream-error-response.jsonl" || {
+      echo "stream-error probe did not receive its first chunk" >&2
+      exit 1
+    }
+    kill -KILL "$MOCKER_PID"
+    set +e
+    wait "$stream_error_curl_pid"
+    stream_error_rc=$?
+    set -e
+    grep -q '"error"' "$STAGING_LOGDIR/stream-error-response.jsonl" || {
+      echo "stream-error probe did not receive an SSE error frame (curl rc=$stream_error_rc)" >&2
+      exit 1
+    }
+    sleep 1
+    echo "[lifecycle-mock] injected streaming backend error"
+    ;;
+esac
+
+# Give the frontend's own OTLP batch processor time to export completed roots
+# before the inner cleanup sends it SIGTERM. (The outer delay only protects the
+# collector and cannot recover spans from an already terminated frontend.)
+sleep "$FRONTEND_OTEL_FLUSH_DELAY_SECS"
 echo "[lifecycle-mock] request completed; logs: $LOGDIR"
 INNER
-
+inner_status=$?
+set -e
 sleep "${OTEL_FLUSH_DELAY_SECS:-3}"
 echo "[lifecycle-mock] OTLP trace JSONL staged at $OTEL_TRACES_FILE"
+exit "$inner_status"
