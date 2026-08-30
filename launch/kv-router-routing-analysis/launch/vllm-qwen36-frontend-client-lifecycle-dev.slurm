@@ -21,10 +21,16 @@ RUN_DIR="$RUNS_ROOT/$RUN_ID"
 SHARED="$RUN_DIR/shared"
 LOGDIR="$RUN_DIR/logs"
 WHEELHOUSE_NAME="${WHEELHOUSE_NAME:-vllm-1.4.1-aarch64}"
+# Keep development wheels on scratch: the home filesystem is quota-limited,
+# while this run root is already mounted by every validation container.
+WHEELHOUSE_ROOT="${WHEELHOUSE_ROOT:-$RUNS_ROOT/wheelhouses}"
 STAGE_ROOT="${STAGE_ROOT:-$HOME/scratch/dynamo_repro/completed_runs}"
 CLIENT_CONCURRENCY="${CLIENT_CONCURRENCY:-1}"
 CLIENT_REQUESTS="${CLIENT_REQUESTS:-4}"
-SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+# Slurm copies batch scripts to its spool directory, so `$0` cannot locate
+# companion collector/nginx files. The submitter supplies this stable source
+# directory for lifecycle development runs.
+SCRIPT_DIR="${LIFECYCLE_LAUNCH_DIR:-$HOST_HOME/scratch/dynamo-lifecycle-dev/launch/kv-router-routing-analysis/launch}"
 MODEL_SOURCE_IMAGE="${MODEL_SOURCE_IMAGE:-nginx:1.27}"
 MODEL_SOURCE_DIR="${MODEL_SOURCE_DIR:-/home/scratch.sbak_coreai/model-cache/Qwen/Qwen3.6-35B-A3B-FP8}"
 MODEL_SOURCE_CONFIG="${MODEL_SOURCE_CONFIG:-$SCRIPT_DIR/nginx-model-source.conf}"
@@ -41,7 +47,7 @@ model_source_pid=
 collector_pid=
 mkdir -p "$SHARED" "$LOGDIR"
 rm -f "$SHARED"/{infra_ip.txt,frontend_ready,prefill_workers_ready,decode_workers_ready,prefill_workers_done,decode_workers_done,model_source_ready,model_source_endpoint.txt,model_source_files.tsv,otel_collector_ready,otel_collector_endpoint.txt,stop_workers}
-export IMAGE MODEL RUN_ID HOST_HOME RUNS_ROOT RUN_DIR SHARED LOGDIR WHEELHOUSE_NAME STAGE_ROOT CLIENT_CONCURRENCY CLIENT_REQUESTS MODEL_SOURCE_IMAGE MODEL_SOURCE_DIR MODEL_SOURCE_CONFIG MODEL_SOURCE_PORT OTELCOL_BIN OTELCOL_TEMPLATE OTELCOL_CONFIG OTEL_TRACES_FILE OTEL_LOGS_FILE DYN_LIFECYCLE_TRACE_ENABLED DYN_LIFECYCLE_TRACE_MODE
+export IMAGE MODEL RUN_ID HOST_HOME RUNS_ROOT RUN_DIR SHARED LOGDIR WHEELHOUSE_NAME WHEELHOUSE_ROOT STAGE_ROOT CLIENT_CONCURRENCY CLIENT_REQUESTS MODEL_SOURCE_IMAGE MODEL_SOURCE_DIR MODEL_SOURCE_CONFIG MODEL_SOURCE_PORT OTELCOL_BIN OTELCOL_TEMPLATE OTELCOL_CONFIG OTEL_TRACES_FILE OTEL_LOGS_FILE DYN_LIFECYCLE_TRACE_ENABLED DYN_LIFECYCLE_TRACE_MODE
 
 stage_logs() {
   local dest="$STAGE_ROOT/$RUN_ID"
@@ -70,7 +76,9 @@ test -f "$OTELCOL_TEMPLATE"
 find "$MODEL_SOURCE_DIR" -maxdepth 1 -type f -printf '%f\t%s\n' | sort >"$SHARED/model_source_files.tsv"
 test -s "$SHARED/model_source_files.tsv"
 
-INFRA_IP=$(ip -4 -o addr show scope global | awk '$2 !~ /^docker|^br-|^virbr/ {print $4}' | cut -d/ -f1 | head -1)
+# Do not terminate the producer early: with `pipefail`, `head -1` can make
+# `ip` fail with SIGPIPE before the frontend has written its ready marker.
+INFRA_IP=$(ip -4 -o addr show scope global | awk '$2 !~ /^docker|^br-|^virbr/ && !found {split($4, address, "/"); print address[1]; found=1}')
 printf '%s\n' "$INFRA_IP" > "$SHARED/infra_ip.txt"
 export INFRA_IP
 echo "[vllm-frontend-client] run=$RUN_ID node=$SLURMD_NODENAME infra_ip=$INFRA_IP"
@@ -109,7 +117,7 @@ srun --overlap --nodes=1 --ntasks=1 --container-image="$IMAGE" \
   --container-mounts="$HOST_HOME:$HOST_HOME,$RUNS_ROOT:$RUNS_ROOT,$MODEL_SOURCE_DIR:/models:ro" --container-remap-root --export=ALL \
   bash -s <<'FRONTEND' &
 set -euo pipefail
-wh="$HOST_HOME/dynamo_repro/wheelhouse-$WHEELHOUSE_NAME"
+wh="$WHEELHOUSE_ROOT/$WHEELHOUSE_NAME"
 pip install --break-system-packages --force-reinstall --no-deps "$wh"/ai_dynamo_runtime*.whl "$wh"/ai_dynamo-*any.whl
 export ETCD_ENDPOINTS="$INFRA_IP:2379" NATS_SERVER="nats://$INFRA_IP:4222"
 etcd --data-dir "/tmp/etcd-$SLURM_JOB_ID" --listen-client-urls http://0.0.0.0:2379 --advertise-client-urls "http://$INFRA_IP:2379" >"$LOGDIR/etcd.log" 2>&1 & ETCD_PID=$!
