@@ -3,8 +3,9 @@
 
 //! Native OpenTelemetry request-lifecycle spans.
 //!
-//! This initial registry emits only native span timing and causal parentage. It
-//! intentionally does not attach request attributes, metrics, or detail data.
+//! The registry starts with native timing and causal parentage. Lifecycle
+//! attributes are deliberately bounded: core mode records stable identifiers
+//! and decision summaries, while investigation mode may add bounded detail.
 
 use std::sync::{
     Arc, OnceLock,
@@ -214,7 +215,36 @@ impl LifecycleStage {
             ),
             Self::RequestPreprocessing => common_span!("request.preprocessing"),
             Self::RouterQueue => common_span!("router.queue"),
-            Self::RouterSelection => common_span!("router.selection"),
+            Self::RouterSelection => tracing::info_span!(
+                target: "dynamo.request_lifecycle", "router.selection",
+                "dynamo.request.id" = %identity.request_id,
+                "dynamo.request.attempt" = 0_u64,
+                "dynamo.operation.id" = %identity.operation_id,
+                "dynamo.operation.role" = identity.role.as_str(),
+                "dynamo.lifecycle.schema" = LIFECYCLE_SCHEMA,
+                "dynamo.lifecycle.profile" = %identity.profile,
+                "dynamo.lifecycle.mode" = %identity.mode,
+                "dynamo.component" = self.component(),
+                "dynamo.instance.id" = instance_id(),
+                "dynamo.process.epoch" = process_epoch(),
+                "dynamo.lifecycle.identity.state" = identity.identity_state,
+                "dynamo.lifecycle.capture.state" = "recorded",
+                "dynamo.router.candidate.count" = tracing::field::Empty,
+                "dynamo.router.algorithm.id" = tracing::field::Empty,
+                "dynamo.router.algorithm.version" = tracing::field::Empty,
+                "dynamo.router.decision.schema" = tracing::field::Empty,
+                "dynamo.router.selection.policy" = tracing::field::Empty,
+                "dynamo.router.pool.role" = tracing::field::Empty,
+                "dynamo.router.selected.worker.id" = tracing::field::Empty,
+                "dynamo.router.selected.dp.rank" = tracing::field::Empty,
+                "dynamo.router.selected.score" = tracing::field::Empty,
+                "dynamo.router.best.worker.id" = tracing::field::Empty,
+                "dynamo.router.best.dp.rank" = tracing::field::Empty,
+                "dynamo.router.best.score" = tracing::field::Empty,
+                "dynamo.router.best.margin" = tracing::field::Empty,
+                "dynamo.router.candidates.detail_schema" = tracing::field::Empty,
+                "dynamo.router.candidates.top_k" = tracing::field::Empty,
+            ),
             Self::WorkerAdmission => common_span!("worker.admission"),
             Self::RequestDispatch => common_span!("request.dispatch"),
             Self::KvTransfer => common_span!("kv.transfer"),
@@ -260,7 +290,11 @@ impl LifecycleTrace {
         Self::with_role(request_id, worker_operation_role())
     }
 
-    /// Construct router capture state. M3 will propagate explicit P/D operation links.
+    /// Construct router capture state.
+    ///
+    /// Router selection is grouped with the request by `request_id`, but it does
+    /// not propagate operation links. Explicit prefill/decode operation linkage
+    /// remains a later lifecycle milestone.
     pub fn router_request(request_id: impl Into<String>) -> Self {
         Self::with_role(request_id, LifecycleOperationRole::Frontend)
     }
@@ -290,6 +324,11 @@ impl LifecycleTrace {
     /// Whether lifecycle spans are emitted for this request.
     pub const fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Investigation mode permits bounded, per-request decision detail.
+    pub fn is_investigation_mode(&self) -> bool {
+        self.enabled && self.identity.mode == "investigation"
     }
 
     /// Start the request root and return a recorder shared with all terminal paths.

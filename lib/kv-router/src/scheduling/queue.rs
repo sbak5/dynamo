@@ -1450,12 +1450,13 @@ impl<
             .project_worker_loads(request.token_seq.as_deref(), decay_now);
 
         #[cfg(feature = "runtime-protocols")]
-        let lifecycle_span = request
+        let lifecycle_trace = request
             .mode
             .request_id()
             .map(LifecycleTrace::router_request)
-            .unwrap_or_else(LifecycleTrace::from_environment)
-            .start(LifecycleStage::RouterSelection);
+            .unwrap_or_else(LifecycleTrace::from_environment);
+        #[cfg(feature = "runtime-protocols")]
+        let lifecycle_span = lifecycle_trace.start(LifecycleStage::RouterSelection);
         #[cfg(not(feature = "runtime-protocols"))]
         let lifecycle_span = tracing::Span::none();
 
@@ -1466,8 +1467,23 @@ impl<
                 .as_ref()
                 .and_then(|provider| provider());
             let eligibility = request.eligibility_with_overloaded(overloaded_worker_ids.as_ref());
+            #[cfg(feature = "runtime-protocols")]
+            let selection_telemetry = lifecycle_trace.is_enabled().then(|| {
+                super::selector::RouterSelectionTelemetry::new(
+                    &lifecycle_span,
+                    lifecycle_trace.is_investigation_mode(),
+                )
+            });
+            #[cfg(not(feature = "runtime-protocols"))]
+            let selection_telemetry = None;
             self.selector
-                .select_worker(&workers, &request, eligibility, self.block_size)
+                .select_worker_with_telemetry(
+                    &workers,
+                    &request,
+                    eligibility,
+                    self.block_size,
+                    selection_telemetry,
+                )
                 .map(|selection| {
                     let config = workers
                         .get(&selection.worker.worker_id)
