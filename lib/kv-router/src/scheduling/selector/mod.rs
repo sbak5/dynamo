@@ -54,6 +54,7 @@ pub enum WorkerSelectionInput<'a, C: WorkerConfigLike> {
         request: &'a SchedulingRequest,
         eligibility: RoutingEligibility<'a>,
         block_size: u32,
+        telemetry: Option<RouterSelectionTelemetry<'a>>,
     },
     Hosted {
         worker_ids: &'a [WorkerId],
@@ -82,6 +83,7 @@ impl<'a, C: WorkerConfigLike> WorkerSelectionInput<'a, C> {
             request,
             eligibility,
             block_size,
+            telemetry: None,
         }
     }
 
@@ -102,11 +104,31 @@ impl<'a, C: WorkerConfigLike> WorkerSelectionInput<'a, C> {
                 request,
                 eligibility,
                 block_size,
+                ..
             } => Ok((workers, request, eligibility, block_size)),
             Self::Hosted { .. } => Err(WorkerSelectionPolicyError::failed(
                 "selector requires configured worker inputs",
             )
             .into()),
+        }
+    }
+
+    /// Attach a request-lifecycle recorder without widening the public policy API.
+    pub(crate) fn with_telemetry(mut self, telemetry: Option<RouterSelectionTelemetry<'a>>) -> Self {
+        if let Self::Configured {
+            telemetry: input_telemetry,
+            ..
+        } = &mut self
+        {
+            *input_telemetry = telemetry;
+        }
+        self
+    }
+
+    fn telemetry(&self) -> Option<RouterSelectionTelemetry<'a>> {
+        match self {
+            Self::Configured { telemetry, .. } => *telemetry,
+            Self::Hosted { .. } => None,
         }
     }
 
@@ -130,6 +152,131 @@ struct LogitWeights {
     overlap_score_credit_decay: f64,
     prefill_load_scale: f64,
     shared_cache_multiplier: f64,
+}
+
+/// A built-in KV-aware candidate score and the scalar inputs that produced it.
+/// This remains internal to the default policy; custom policies are not required
+/// to expose the same score decomposition.
+#[derive(Debug, Clone, Copy)]
+struct DefaultCandidateScore {
+    cost: f64,
+    base_cost: f64,
+    preferred_taint_multiplier: f64,
+    raw_prefill_blocks: f64,
+    overlap_credit_blocks: f64,
+    decode_cost_blocks: f64,
+    active_request_cost_blocks: f64,
+    device_overlap_blocks: f64,
+    host_overlap_blocks: f64,
+    disk_overlap_blocks: f64,
+    shared_blocks_beyond: u32,
+    active_prefill_tokens: usize,
+    active_decode_blocks: usize,
+}
+
+/// Bounded decision evidence written to a lifecycle `router.selection` span.
+/// Core mode records a stable summary. Investigation mode additionally records
+/// at most four built-in KV-aware candidate decompositions.
+#[derive(Clone, Copy)]
+pub(crate) struct RouterSelectionTelemetry<'a> {
+    span: &'a tracing::Span,
+    include_candidate_details: bool,
+}
+
+impl<'a> RouterSelectionTelemetry<'a> {
+    pub(crate) fn new(span: &'a tracing::Span, include_candidate_details: bool) -> Self {
+        Self {
+            span,
+            include_candidate_details,
+        }
+    }
+
+    fn record_kv_aware(
+        self,
+        candidates: &[(WorkerWithDpRank, DefaultCandidateScore)],
+        selected_worker: WorkerWithDpRank,
+        selected_score: DefaultCandidateScore,
+        pool_role: &'static str,
+    ) {
+        debug_assert!(!candidates.is_empty());
+        let mut ranked = candidates.to_vec();
+        ranked.sort_unstable_by(|(left_worker, left), (right_worker, right)| {
+            left.cost
+                .total_cmp(&right.cost)
+                .then_with(|| left_worker.cmp(right_worker))
+        });
+        let (best_worker, best_score) = ranked[0];
+        let best_margin = ranked
+            .get(1)
+            .map(|(_, score)| score.cost - best_score.cost)
+            .unwrap_or(0.0);
+
+        self.span
+            .record("dynamo.router.candidate.count", candidates.len() as u64);
+        self.span.record("dynamo.router.algorithm.id", "kv_aware");
+        self.span.record("dynamo.router.algorithm.version", "v1");
+        self.span
+            .record("dynamo.router.decision.schema", "kv_aware.v1");
+        self.span
+            .record("dynamo.router.selection.policy", "kv_aware");
+        self.span.record("dynamo.router.pool.role", pool_role);
+        self.span.record(
+            "dynamo.router.selected.worker.id",
+            selected_worker.worker_id,
+        );
+        self.span.record(
+            "dynamo.router.selected.dp.rank",
+            selected_worker.dp_rank as u64,
+        );
+        self.span
+            .record("dynamo.router.selected.score", selected_score.cost);
+        self.span
+            .record("dynamo.router.best.worker.id", best_worker.worker_id);
+        self.span
+            .record("dynamo.router.best.dp.rank", best_worker.dp_rank as u64);
+        self.span
+            .record("dynamo.router.best.score", best_score.cost);
+        self.span.record("dynamo.router.best.margin", best_margin);
+
+        if self.include_candidate_details {
+            const TOP_K: usize = 4;
+            self.span.record(
+                "dynamo.router.candidates.detail_schema",
+                "kv_aware.v1",
+            );
+            let details = ranked
+                .iter()
+                .take(TOP_K)
+                .map(|(worker, score)| {
+                    format!(
+                        concat!(
+                            r#"{{"worker_id":{},"dp_rank":{},"score":{:.6},"base_score":{:.6},"preferred_taint_multiplier":{:.6},"raw_prefill_blocks":{:.6},"overlap_credit_blocks":{:.6},"decode_cost_blocks":{:.6},"active_request_cost_blocks":{:.6},"device_overlap_blocks":{:.6},"host_overlap_blocks":{:.6},"disk_overlap_blocks":{:.6},"shared_blocks_beyond":{},"active_prefill_tokens":{},"active_decode_blocks":{}}}"#
+                        ),
+                        worker.worker_id,
+                        worker.dp_rank,
+                        score.cost,
+                        score.base_cost,
+                        score.preferred_taint_multiplier,
+                        score.raw_prefill_blocks,
+                        score.overlap_credit_blocks,
+                        score.decode_cost_blocks,
+                        score.active_request_cost_blocks,
+                        score.device_overlap_blocks,
+                        score.host_overlap_blocks,
+                        score.disk_overlap_blocks,
+                        score.shared_blocks_beyond,
+                        score.active_prefill_tokens,
+                        score.active_decode_blocks,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            self.span.record(
+                "dynamo.router.candidates.top_k",
+                format!("[{details}]"),
+            );
+        }
+    }
 }
 
 struct MaterializedSelectionInput<'a> {
@@ -362,6 +509,7 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
     request: &SchedulingRequest,
     eligibility: RoutingEligibility<'_>,
     block_size: u32,
+    telemetry: Option<RouterSelectionTelemetry<'_>>,
 ) -> Result<WorkerSelectionResult, KvSchedulerError> {
     assert!(request.isl_tokens > 0);
     eligibility.validate_pinned_worker_allowed()?;
@@ -386,7 +534,15 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
                 kv_router_config,
                 worker_type,
             };
-            pick_default_worker(&scorer, picker, &input, workers, request, eligibility)
+            pick_default_worker(
+                &scorer,
+                picker,
+                &input,
+                workers,
+                request,
+                eligibility,
+                telemetry,
+            )
         }
         WorkerSelectionPolicyStateRef::Custom(state) => {
             let mut state = state.borrow_mut();

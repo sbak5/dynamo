@@ -5,6 +5,8 @@
 //!
 //! Coarse runtime timing, causal parentage, request identity, and terminal outcomes.
 //! Engine-internal metrics and invariants are intentionally not instrumented here.
+//! Lifecycle attributes are deliberately bounded: core mode records stable identifiers
+//! and decision summaries, while investigation mode may add bounded detail.
 
 use std::sync::{
     Arc, OnceLock,
@@ -119,14 +121,14 @@ impl LifecycleIdentity {
 /// runtime boundaries around the worker operation; they are not direct engine
 /// execution measurements.
 ///
-/// Router queue and selection stages are intentionally deferred. A later
-/// instrumentation milestone will add spans at the actual scheduling
-/// boundaries together with the router-specific metrics and invariants needed
-/// to interpret them.
+/// Router queue and selection stages describe scheduling boundaries and carry
+/// router-specific evidence for interpreting those decisions.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LifecycleStage {
     RequestLifecycle,
     RequestPreprocessing,
+    RouterQueue,
+    RouterSelection,
     WorkerAdmission,
     RequestDispatch,
     WorkerOperation,
@@ -141,6 +143,7 @@ pub enum LifecycleStage {
 impl LifecycleStage {
     const fn component(self) -> &'static str {
         match self {
+            Self::RouterQueue | Self::RouterSelection => "router",
             Self::RequestLifecycle | Self::RequestPreprocessing | Self::ResponseStreaming => {
                 "frontend"
             }
@@ -193,6 +196,37 @@ impl LifecycleStage {
                 "dynamo.request.terminal.error" = tracing::field::Empty,
             ),
             Self::RequestPreprocessing => common_span!("request.preprocessing"),
+            Self::RouterQueue => common_span!("router.queue"),
+            Self::RouterSelection => tracing::info_span!(
+                target: "dynamo.request_lifecycle", "router.selection",
+                "dynamo.request.id" = %identity.request_id,
+                "dynamo.request.attempt" = 0_u64,
+                "dynamo.operation.id" = %identity.operation_id,
+                "dynamo.operation.role" = identity.role.as_str(),
+                "dynamo.lifecycle.schema" = LIFECYCLE_SCHEMA,
+                "dynamo.lifecycle.profile" = %identity.profile,
+                "dynamo.lifecycle.mode" = %identity.mode,
+                "dynamo.component" = self.component(),
+                "dynamo.instance.id" = instance_id(),
+                "dynamo.process.epoch" = process_epoch(),
+                "dynamo.lifecycle.identity.state" = identity.identity_state,
+                "dynamo.lifecycle.capture.state" = "recorded",
+                "dynamo.router.candidate.count" = tracing::field::Empty,
+                "dynamo.router.algorithm.id" = tracing::field::Empty,
+                "dynamo.router.algorithm.version" = tracing::field::Empty,
+                "dynamo.router.decision.schema" = tracing::field::Empty,
+                "dynamo.router.selection.policy" = tracing::field::Empty,
+                "dynamo.router.pool.role" = tracing::field::Empty,
+                "dynamo.router.selected.worker.id" = tracing::field::Empty,
+                "dynamo.router.selected.dp.rank" = tracing::field::Empty,
+                "dynamo.router.selected.score" = tracing::field::Empty,
+                "dynamo.router.best.worker.id" = tracing::field::Empty,
+                "dynamo.router.best.dp.rank" = tracing::field::Empty,
+                "dynamo.router.best.score" = tracing::field::Empty,
+                "dynamo.router.best.margin" = tracing::field::Empty,
+                "dynamo.router.candidates.detail_schema" = tracing::field::Empty,
+                "dynamo.router.candidates.top_k" = tracing::field::Empty,
+            ),
             Self::WorkerAdmission => common_span!("worker.admission"),
             Self::RequestDispatch => common_span!("request.dispatch"),
             Self::WorkerOperation => common_span!("worker.operation"),
@@ -260,6 +294,15 @@ impl LifecycleTrace {
         Self::enabled(LifecycleIdentity::new(Some(request_id.into()), role), None)
     }
 
+    /// Construct router capture state.
+    ///
+    /// Router selection is grouped with the request by `request_id`, but it does
+    /// not propagate operation links. Explicit prefill/decode operation linkage
+    /// remains a later lifecycle milestone.
+    pub fn router_request(request_id: impl Into<String>) -> Self {
+        Self::with_role(request_id, LifecycleOperationRole::Frontend)
+    }
+
     /// Construct frontend capture state and root-only session identity.
     pub fn frontend_request(request_id: impl Into<String>, session_id: Option<String>) -> Self {
         if !lifecycle_tracing_enabled() {
@@ -308,6 +351,15 @@ impl LifecycleTrace {
     /// Whether lifecycle spans are emitted for this request.
     pub const fn is_enabled(&self) -> bool {
         self.enabled
+    }
+
+    /// Investigation mode permits bounded, per-request decision detail.
+    pub fn is_investigation_mode(&self) -> bool {
+        self.enabled
+            && self
+                .identity
+                .as_ref()
+                .is_some_and(|identity| identity.mode == "investigation")
     }
 
     /// Start the request root and return a recorder shared with all terminal paths.
