@@ -1,9 +1,10 @@
 # Lifecycle instrumentation implementation progress
 
-Last updated: 2026-08-25
+Last updated: 2026-08-27
 
-This is the working implementation record for native, timing-only OpenTelemetry
-lifecycle spans in the Dynamo v1.4.1 runtime. It complements:
+This is the working implementation record for native OpenTelemetry lifecycle
+instrumentation in the Dynamo v1.4.1 runtime. M1 established timing boundaries;
+M2 adds typed request identity and one-shot terminal outcomes. It complements:
 
 - `LIFECYCLE_INTERACTIVE_DEVELOPMENT.md` — fresh-session setup and iterative mock.
 - `LIFECYCLE_SPAN_DEVELOPMENT_RUNBOOK.md` — broader lifecycle-span operating notes.
@@ -11,15 +12,17 @@ lifecycle spans in the Dynamo v1.4.1 runtime. It complements:
 
 ## Current scope
 
-The implementation is deliberately limited to timing boundaries. It does not yet
-add the proposal's typed lifecycle attributes, terminal outcomes, queue-depth
-facts, token counts, KV byte counts, or anomaly thresholds.
+M1 and M2 deliberately stop short of detailed metrics. The runtime now provides
+timing boundaries, a versioned lifecycle profile/mode, request/session/operation
+identity, and a terminal result. It does not yet add queue-depth facts, token
+counts, KV byte counts, direct engine events, or anomaly thresholds.
 
 - Branch: `sbak/lifecycle-runtime-instrumentation`
 - Development worktree: `~/scratch/dynamo-lifecycle-dev`
 - Clean build checkout: `~/scratch/dynamo`
 - Runtime/build image: `nvcr.io/nvidia/ai-dynamo/vllm-runtime:1.4.1`
 - Feature gate: `DYN_LIFECYCLE_TRACE_ENABLED=true`
+- Pushed branch head: `7b9b55eca3` on `fork/sbak/lifecycle-runtime-instrumentation`
 
 Do not modify the clean checkout's canonical real-workload launchers. The
 development worktree holds the implementation and its development-only launch
@@ -76,6 +79,83 @@ response.streaming.prefill
 response.streaming.decode
 response.streaming          # frontend-to-client stream
 response.streaming.worker   # role is unknown or aggregated
+```
+
+## M2: typed identity and terminal outcomes
+
+M2 is implemented in the Rust runtime. Each retained `request.lifecycle` root
+now carries the bounded schema needed to group a request's frontend, router,
+and worker timing spans:
+
+```text
+dynamo.lifecycle.schema=v1
+dynamo.lifecycle.profile=generic.v1     # configurable with DYN_LIFECYCLE_TRACE_PROFILE
+dynamo.lifecycle.mode=core              # configurable with DYN_LIFECYCLE_TRACE_MODE
+dynamo.request.id=<UUID>
+dynamo.request.attempt=0
+dynamo.session.id=<agent session or request-id fallback>
+dynamo.session.source=<agent_context|request_id_fallback>
+dynamo.operation.id=<per-operation UUID>
+dynamo.operation.role=<frontend|prefill|decode|worker>
+dynamo.request.terminal.outcome=<success|rejected|timed_out|failed|cancelled|unknown>
+dynamo.request.terminal.error=<bool>
+```
+
+`request_id` is the grouping key for all P/D work for an end-user request.
+`operation_id` distinguishes operation waves within that request. Each router
+selection currently begins a distinct frontend-role operation wave. M3 will add
+explicit `dynamo.operation.parent_id` and/or OTel links for P→D causality.
+That relationship is intentionally not inferred from a shared request ID.
+
+The terminal recorder is one-shot: concurrent completion, disconnect, timeout,
+and backend-error paths cannot overwrite the first observed outcome. The
+frontend maps HTTP 4xx responses to `rejected`, typed request-plane
+`ResponseTimeout` errors to `timed_out`, client disconnects to `cancelled`,
+and streamed backend errors to `failed`.
+
+The timeout injection pauses a worker before its first response. It therefore
+exercises `DYN_TCP_REQUEST_TIMEOUT` (five seconds by default), rather than the
+post-SSE inactivity safety net controlled by
+`DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS`.
+
+### M2 source changes
+
+| File | M2 responsibility |
+| --- | --- |
+| `lib/runtime/src/telemetry.rs` | Versioned profile/mode, lifecycle identity, operation role, root terminal recorder, and the M3 propagation note. |
+| `lib/llm/src/http/service/openai.rs` | Creates the frontend root, propagates identity, and records HTTP, timeout, streaming, and task-failure terminal paths. |
+| `lib/llm/src/http/service/disconnect.rs` | Records `cancelled`, `timed_out`, and `failed` at the definitive stream/connection-monitor paths. |
+| `lib/llm/src/http/service/metrics.rs` | Detects typed response-timeout errors without parsing error text. |
+| `lib/runtime/src/pipeline/network/egress/tcp_client.rs` | Classifies an elapsed request deadline as `ResponseTimeout`, while retaining `CannotConnect` for connection failures. |
+| `lib/llm/src/preprocessor.rs`, `lib/runtime/src/pipeline/network/ingress/push_handler.rs`, `lib/kv-router/src/scheduling/queue.rs`, `lib/backend-common/src/adapter.rs` | Preserve request-scoped lifecycle identity at frontend, router, and worker boundaries. |
+| `lib/runtime/src/config/environment_names.rs` | Declares the profile/mode configuration names. |
+
+### M2 build and terminal-path validation
+
+The M2 override wheels were built from this worktree with the required base
+image and validated with the frontend-only mock. The mock is development-only;
+it does not modify the real P/D workload launchers.
+
+| Item | Evidence |
+| --- | --- |
+| Build | Job `1968025`, `COMPLETED (0:0)` on `gh-nvl-203-compute02`; wheelhouse `~/dynamo_repro/wheelhouse-vllm-1.4.1-lifecycle-m2-terminal-fix-aarch64/`. |
+| Rejected request | Unknown-model 404 exported a `request.lifecycle` root with `terminal.outcome=rejected`, `terminal.error=true`: `~/scratch/dynamo_repro/completed_runs/lifecycle_m2_terminal_matrix_fix_20260827_175000/logs/otel-traces.jsonl`. |
+| Timed-out request | Job `1968118`, `COMPLETED (0:0)`. A paused request produced `timed_out` after 5.00 s: `~/scratch/dynamo_repro/completed_runs/lifecycle_m2_timeout_root_20260827_180600/logs/otel-traces.jsonl`. |
+| Streaming backend error | Job `1968103`, `COMPLETED (0:0)`. The worker was killed after visible SSE data; the client received a structured error plus `[DONE]`, and the root was `failed`: `~/scratch/dynamo_repro/completed_runs/lifecycle_m2_stream_error_root_20260827_180200/logs/otel-traces.jsonl`. |
+| Client cancellation | Earlier focused mock validation exported `cancelled`: `~/scratch/dynamo_repro/completed_runs/lifecycle_m2_cancel_fix_20260827_002013/logs/otel-traces.jsonl`. |
+
+The fault-injection harness is `launch/lifecycle-runtime-mock.slurm`. Select
+its independent probes with `LIFECYCLE_TEST_CASES=rejected`, `timed_out`,
+`stream_error`, or `cancelled`. It stages logs on both success and injected
+failure, then waits for frontend and Collector OTLP batches to flush before
+teardown. Run timeout and worker-kill probes in separate mock allocations:
+each intentionally makes the sole mock worker unavailable.
+
+M2 commits on the pushed branch:
+
+```text
+b792535a6b chore(dev): add lifecycle terminal fault injection
+7b9b55eca3 feat(runtime): add M2 lifecycle identity and terminal outcomes
 ```
 
 ## Development launch support
@@ -180,7 +260,8 @@ the root cause because the boundary still includes uninstrumented backend work.
 | Router queue dwell | `UNKNOWN` | No `router.queue` span was retained; conditional applicability cannot be inferred from absence alone. |
 | Engine queue dwell | `UNKNOWN` | No `engine.queue` span was retained. |
 | Observed KV-transfer duration | `UNKNOWN` | No `kv.transfer` span was retained. vLLM metrics are not a replacement for request-correlated timing. |
-| Terminal outcome and finish reason | `UNKNOWN` | This timing-only stage adds no terminal schema/status. |
+| Lifecycle schema, identity, and terminal outcome | Observed | M2 exports versioned typed root attributes and one-shot outcomes. |
+| Explicit P→D operation parent/link | Not yet implemented | M3 must propagate causality; request identity alone is not a parent relation. |
 | Cohort residual or `VIOLATED` decision | `UNKNOWN` | Only one workload cohort exists; there is no versioned matched baseline. |
 | Fine router subspans | Partial | One second-occurrence `kv_router.compute_seq_hashes` span is absent (511/512); this is auxiliary evidence, not a registered lifecycle stage. |
 
@@ -191,12 +272,14 @@ the root cause because the boundary still includes uninstrumented backend work.
 2. Add authoritative backend signals for `engine.queue`, `engine.prefill`,
    `engine.decode`, and observed NIXL `kv.transfer` completion. Do not infer
    them from metrics or from missing spans.
-3. Add the proposal's typed schema: lifecycle profile/mode, operation identity,
-   terminal outcome, bounded router facts, and backend capability table.
-4. Implement coverage and state-machine validation, including an explicit
+3. Add M3 operation causality: propagate parent operation identity and/or OTel
+   links between prefill and decode, without overloading `request_id`.
+4. Add bounded router facts and a backend capability table; retain `UNKNOWN`
+   where direct backend evidence is unavailable.
+5. Implement coverage and state-machine validation, including an explicit
    `UNKNOWN` result for sampled, dropped, unsupported, or conditionally absent
    evidence.
-5. Build matched workload cohorts before assigning `VIOLATED` / `HOLDS` latency
+6. Build matched workload cohorts before assigning `VIOLATED` / `HOLDS` latency
    residuals; this single run only supports within-run timing localization.
 
 ## Repeat the validated real run
