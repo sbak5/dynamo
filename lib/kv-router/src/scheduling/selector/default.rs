@@ -10,9 +10,9 @@ use parking_lot::Mutex;
 
 use super::policy::WorkerSelectionPolicyStateRef;
 use super::{
-    LogitWeights, MaterializedSelectionInput, ScoredWorkerCandidate, WorkerCandidate,
-    WorkerInputView, WorkerInputs, WorkerPicker, WorkerSelectionContext, WorkerSelectionInput,
-    WorkerSelector, select_worker_with_policy,
+    DefaultCandidateScore, LogitWeights, MaterializedSelectionInput, RouterSelectionTelemetry,
+    ScoredWorkerCandidate, WorkerCandidate, WorkerInputView, WorkerInputs, WorkerPicker,
+    WorkerSelectionContext, WorkerSelectionInput, WorkerSelector, select_worker_with_policy,
 };
 use crate::protocols::{WorkerConfigLike, WorkerId, WorkerSelectionResult, WorkerWithDpRank};
 use crate::scheduling::config::KvRouterConfig;
@@ -271,13 +271,13 @@ fn default_row(
 }
 
 impl<C: Borrow<KvRouterConfig>> DefaultWorkerScorer<C> {
-    fn worker_logit(
+    fn worker_score(
         &self,
         context: &WorkerSelectionContext<'_>,
         default_context: DefaultScoringContext,
         row: &WorkerCandidate,
         formula_name: &'static str,
-    ) -> f64 {
+    ) -> DefaultCandidateScore {
         let kv_router_config = self.kv_router_config.borrow();
         let weights = context.weights;
         let worker = row.worker;
@@ -339,7 +339,24 @@ impl<C: Borrow<KvRouterConfig>> DefaultWorkerScorer<C> {
                 worker.worker_id,
                 worker.dp_rank,
             );
-            return logit;
+            return DefaultCandidateScore {
+                cost: logit,
+                base_cost: logit,
+                preferred_taint_multiplier: 1.0,
+                raw_prefill_blocks: load.raw_prefill_blocks,
+                overlap_credit_blocks,
+                decode_cost_blocks,
+                active_request_cost_blocks,
+                device_overlap_blocks,
+                host_overlap_blocks: cache.host_overlap_blocks,
+                disk_overlap_blocks: cache.disk_overlap_blocks,
+                shared_blocks_beyond: shared_beyond_device_blocks,
+                active_prefill_tokens: load.active_prefill_tokens,
+                active_decode_blocks: context
+                    .request
+                    .worker_load_for(worker)
+                    .active_decode_blocks,
+            };
         }
 
         let adjusted_prefill_blocks = (load.raw_prefill_blocks - overlap_credit_blocks).max(0.0);
@@ -385,7 +402,35 @@ impl<C: Borrow<KvRouterConfig>> DefaultWorkerScorer<C> {
             );
         }
 
-        logit
+        DefaultCandidateScore {
+            cost: logit,
+            base_cost: logit,
+            preferred_taint_multiplier: 1.0,
+            raw_prefill_blocks: load.raw_prefill_blocks,
+            overlap_credit_blocks,
+            decode_cost_blocks,
+            active_request_cost_blocks,
+            device_overlap_blocks,
+            host_overlap_blocks: cache.host_overlap_blocks,
+            disk_overlap_blocks: cache.disk_overlap_blocks,
+            shared_blocks_beyond: shared_beyond_device_blocks,
+            active_prefill_tokens: load.active_prefill_tokens,
+            active_decode_blocks: context
+                .request
+                .worker_load_for(worker)
+                .active_decode_blocks,
+        }
+    }
+
+    fn worker_logit(
+        &self,
+        context: &WorkerSelectionContext<'_>,
+        default_context: DefaultScoringContext,
+        row: &WorkerCandidate,
+        formula_name: &'static str,
+    ) -> f64 {
+        self.worker_score(context, default_context, row, formula_name)
+            .cost
     }
 
     #[inline]
@@ -439,7 +484,7 @@ fn minimum_cost_index(
 }
 
 #[inline(always)]
-pub(super) fn pick_default_worker<C: WorkerConfigLike>(
+fn pick_default_worker_inner<C: WorkerConfigLike>(
     scorer: &DefaultWorkerScorer<&KvRouterConfig>,
     picker: &DefaultWorkerPicker,
     input: &MaterializedSelectionInput<'_>,
@@ -553,6 +598,64 @@ pub(super) fn pick_default_worker<C: WorkerConfigLike>(
     }
 }
 
+pub(super) fn pick_default_worker<C: WorkerConfigLike>(
+    scorer: &DefaultWorkerScorer<&KvRouterConfig>,
+    picker: &DefaultWorkerPicker,
+    input: &MaterializedSelectionInput<'_>,
+    workers: &HashMap<WorkerId, C>,
+    request: &SchedulingRequest,
+    eligibility: RoutingEligibility<'_>,
+    telemetry: Option<RouterSelectionTelemetry<'_>>,
+) -> Option<(WorkerWithDpRank, f64)> {
+    let selected = pick_default_worker_inner(
+        scorer,
+        picker,
+        input,
+        workers,
+        request,
+        eligibility,
+    );
+    let (selected_worker, _) = selected?;
+    let Some(telemetry) = telemetry else {
+        return selected;
+    };
+
+    let default_context =
+        DefaultScoringContext::new(workers, request, eligibility, input.context.weights);
+    let mut candidates = Vec::new();
+    let mut collect = |worker: WorkerWithDpRank, config: &C| {
+        let multiplier = request
+            .routing_constraints
+            .preferred_taint_multiplier(config.taints());
+        let row = default_row(input, default_context, worker, multiplier);
+        let mut score = scorer.worker_score(&input.context, default_context, &row, "Telemetry formula");
+        if let Some(multiplier) = multiplier {
+            score.preferred_taint_multiplier = multiplier;
+            score.cost *= multiplier;
+        }
+        candidates.push((worker, score));
+    };
+    if let Some(pinned) = eligibility.pinned_worker() {
+        if let Some(config) = workers.get(&pinned.worker_id) {
+            collect(pinned, config);
+        }
+    } else {
+        eligibility.for_each_eligible_worker_rank(workers, |worker, config| collect(worker, config));
+    }
+    let selected_score = candidates
+        .iter()
+        .find(|(worker, _)| *worker == selected_worker)
+        .map(|(_, score)| *score)
+        .expect("selected worker must be among eligible candidates");
+    telemetry.record_kv_aware(
+        &candidates,
+        selected_worker,
+        selected_score,
+        scorer.worker_type,
+    );
+    selected
+}
+
 impl DefaultWorkerPicker {
     fn from_parts(
         default_temperature: f64,
@@ -622,6 +725,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
         &self,
         input: WorkerSelectionInput<'_, C>,
     ) -> Result<WorkerSelectionResult, KvSchedulerError> {
+        let telemetry = input.telemetry();
         let (workers, request, eligibility, block_size) = input.into_configured()?;
         select_worker_with_policy(
             &self.kv_router_config,
@@ -631,6 +735,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             request,
             eligibility,
             block_size,
+            telemetry,
         )
     }
 }

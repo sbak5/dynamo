@@ -12,6 +12,9 @@ use parking_lot::Mutex;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::Instant;
 
+#[cfg(feature = "runtime-protocols")]
+use dynamo_runtime::telemetry::{LifecycleStage, LifecycleTrace};
+
 use super::config::RouterQueuePolicy;
 use super::filter::RoutingEligibility;
 use super::overlap::SelectedWorkerTierSnapshot;
@@ -1386,6 +1389,17 @@ impl<
             .slots
             .project_worker_loads(request.token_seq.as_deref(), decay_now);
 
+        #[cfg(feature = "runtime-protocols")]
+        let lifecycle_trace = request
+            .mode
+            .request_id()
+            .map(LifecycleTrace::router_request)
+            .unwrap_or_else(LifecycleTrace::from_environment);
+        #[cfg(feature = "runtime-protocols")]
+        let lifecycle_span = lifecycle_trace.start(LifecycleStage::RouterSelection);
+        #[cfg(not(feature = "runtime-protocols"))]
+        let lifecycle_span = tracing::Span::none();
+
         {
             let workers = self.workers_with_configs.borrow();
             let overloaded_worker_ids = self
@@ -1411,6 +1425,17 @@ impl<
                     request,
                     eligibility,
                     self.block_size,
+                )
+                .with_telemetry(
+                    #[cfg(feature = "runtime-protocols")]
+                    lifecycle_trace.is_enabled().then(|| {
+                        super::selector::RouterSelectionTelemetry::new(
+                            &lifecycle_span,
+                            lifecycle_trace.is_investigation_mode(),
+                        )
+                    }),
+                    #[cfg(not(feature = "runtime-protocols"))]
+                    None,
                 ))
                 .map(|selection| {
                     let non_max_overlap_selection = if request.mode.is_tracked()

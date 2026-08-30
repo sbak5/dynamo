@@ -608,6 +608,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for WorkerSelectionPolicy {
         &self,
         input: WorkerSelectionInput<'_, C>,
     ) -> Result<WorkerSelectionResult, KvSchedulerError> {
+        let telemetry = input.telemetry();
         let (workers, request, eligibility, block_size) = input.into_configured()?;
         let state = match &self.state {
             WorkerSelectionPolicyState::Default(picker) => {
@@ -625,6 +626,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for WorkerSelectionPolicy {
             request,
             eligibility,
             block_size,
+            telemetry,
         )
     }
 }
