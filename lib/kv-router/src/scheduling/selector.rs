@@ -25,6 +25,160 @@ pub trait WorkerSelector<C: WorkerConfigLike> {
         eligibility: RoutingEligibility<'_>,
         block_size: u32,
     ) -> Result<WorkerSelectionResult, KvSchedulerError>;
+
+    /// Select a worker and, when supplied, record the built-in KV-aware
+    /// decision summary on the request-lifecycle `router.selection` span.
+    ///
+    /// The default preserves the public custom-selector contract: selectors
+    /// that do not expose this score model can continue to implement
+    /// `select_worker` only. A later pluggable-router interface will define
+    /// how other algorithms register their own decision schemas.
+    fn select_worker_with_telemetry(
+        &self,
+        workers: &HashMap<WorkerId, C>,
+        request: &SchedulingRequest,
+        eligibility: RoutingEligibility<'_>,
+        block_size: u32,
+        _telemetry: Option<RouterSelectionTelemetry<'_>>,
+    ) -> Result<WorkerSelectionResult, KvSchedulerError> {
+        self.select_worker(workers, request, eligibility, block_size)
+    }
+}
+
+/// A candidate's final score under the built-in KV-aware routing algorithm
+/// and the scalar inputs that produced it.
+///
+/// The score fields are retained only while the selector evaluates one
+/// decision. Investigation mode serializes at most four of these records on
+/// the lifecycle span; core mode records only the chosen-score summary.
+#[derive(Debug, Clone, Copy)]
+struct CandidateScore {
+    /// Final score after the preferred-taint multiplier. Lower is preferred.
+    logit: f64,
+    /// Score before the preferred-taint multiplier.
+    base_score: f64,
+    preferred_taint_multiplier: f64,
+    raw_prefill_blocks: f64,
+    overlap_credit_blocks: f64,
+    decode_cost_blocks: f64,
+    active_request_cost_blocks: f64,
+    device_overlap_blocks: f64,
+    host_overlap_blocks: f64,
+    disk_overlap_blocks: f64,
+    shared_blocks_beyond: u32,
+    active_prefill_tokens: usize,
+    active_decode_blocks: usize,
+}
+
+/// Bounded KV-aware decision detail recorded on a lifecycle `router.selection`
+/// span.
+///
+/// The selector only receives this recorder when lifecycle capture is enabled.
+/// Every mode records the selected worker and score summary. Investigation mode
+/// additionally records the best four candidates as a compact JSON array,
+/// including the scalar decomposition of each KV-aware score. Candidate
+/// identities and detail therefore remain bounded even for a large router
+/// fleet. This is deliberately not a generic plugin score contract.
+pub struct RouterSelectionTelemetry<'a> {
+    span: &'a tracing::Span,
+    include_candidate_details: bool,
+}
+
+impl<'a> RouterSelectionTelemetry<'a> {
+    pub fn new(span: &'a tracing::Span, include_candidate_details: bool) -> Self {
+        Self {
+            span,
+            include_candidate_details,
+        }
+    }
+
+    fn record_kv_aware(
+        &self,
+        candidates: &[(WorkerWithDpRank, CandidateScore)],
+        selected_worker: WorkerWithDpRank,
+        selected_score: CandidateScore,
+        pool_role: &'static str,
+    ) {
+        debug_assert!(!candidates.is_empty());
+
+        let mut ranked = candidates.to_vec();
+        ranked.sort_unstable_by(|(left_worker, left_score), (right_worker, right_score)| {
+            left_score
+                .logit
+                .total_cmp(&right_score.logit)
+                .then_with(|| left_worker.cmp(right_worker))
+        });
+        let (best_worker, best_score) = ranked[0];
+        let best_margin = ranked
+            .get(1)
+            .map(|(_, score)| score.logit - best_score.logit)
+            .unwrap_or(0.0);
+
+        self.span
+            .record("dynamo.router.candidate.count", candidates.len() as u64);
+        self.span
+            .record("dynamo.router.algorithm.id", "kv_aware");
+        self.span
+            .record("dynamo.router.algorithm.version", "v1");
+        self.span
+            .record("dynamo.router.decision.schema", "kv_aware.v1");
+        self.span
+            .record("dynamo.router.selection.policy", "kv_aware");
+        self.span
+            .record("dynamo.router.pool.role", pool_role);
+        self.span
+            .record("dynamo.router.selected.worker.id", selected_worker.worker_id);
+        self.span
+            .record("dynamo.router.selected.dp.rank", selected_worker.dp_rank as u64);
+        self.span
+            .record("dynamo.router.selected.score", selected_score.logit);
+        self.span
+            .record("dynamo.router.best.worker.id", best_worker.worker_id);
+        self.span
+            .record("dynamo.router.best.dp.rank", best_worker.dp_rank as u64);
+        self.span.record("dynamo.router.best.score", best_score.logit);
+        self.span
+            .record("dynamo.router.best.margin", best_margin);
+
+        if self.include_candidate_details {
+            const TOP_K: usize = 4;
+            self.span.record(
+                "dynamo.router.candidates.detail_schema",
+                "kv_aware.v1",
+            );
+            let details = ranked
+                .iter()
+                .take(TOP_K)
+                .map(|(worker, score)| {
+                    format!(
+                        concat!(
+                            r#"{{"worker_id":{},"dp_rank":{},"score":{:.6},"base_score":{:.6},"preferred_taint_multiplier":{:.6},"raw_prefill_blocks":{:.6},"overlap_credit_blocks":{:.6},"decode_cost_blocks":{:.6},"active_request_cost_blocks":{:.6},"device_overlap_blocks":{:.6},"host_overlap_blocks":{:.6},"disk_overlap_blocks":{:.6},"shared_blocks_beyond":{},"active_prefill_tokens":{},"active_decode_blocks":{}}}"#
+                        ),
+                        worker.worker_id,
+                        worker.dp_rank,
+                        score.logit,
+                        score.base_score,
+                        score.preferred_taint_multiplier,
+                        score.raw_prefill_blocks,
+                        score.overlap_credit_blocks,
+                        score.decode_cost_blocks,
+                        score.active_request_cost_blocks,
+                        score.device_overlap_blocks,
+                        score.host_overlap_blocks,
+                        score.disk_overlap_blocks,
+                        score.shared_blocks_beyond,
+                        score.active_prefill_tokens,
+                        score.active_decode_blocks,
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(",");
+            self.span.record(
+                "dynamo.router.candidates.top_k",
+                format!("[{details}]"),
+            );
+        }
+    }
 }
 
 /// Helper function for softmax sampling.
@@ -143,7 +297,7 @@ impl DefaultWorkerSelector {
         min_active_prefill_tokens: usize,
         weights: LogitWeights,
         formula_name: &'static str,
-    ) -> f64 {
+    ) -> CandidateScore {
         let block_size_f64 = block_size as f64;
         let effective_overlap_blocks = request.effective_overlap_blocks_for(worker);
         let has_tier_overlap_blocks = !request.overlap.tier_overlap_blocks.device.is_empty()
@@ -261,7 +415,21 @@ impl DefaultWorkerSelector {
                 worker.worker_id,
                 worker.dp_rank,
             );
-            return logit;
+            return CandidateScore {
+                logit,
+                base_score: logit,
+                preferred_taint_multiplier: 1.0,
+                raw_prefill_blocks,
+                overlap_credit_blocks,
+                decode_cost_blocks,
+                active_request_cost_blocks,
+                device_overlap_blocks,
+                host_overlap_blocks,
+                disk_overlap_blocks,
+                shared_blocks_beyond: shared_beyond,
+                active_prefill_tokens: worker_load.active_prefill_tokens,
+                active_decode_blocks: worker_load.active_decode_blocks,
+            };
         }
 
         let adjusted_prefill_blocks = (raw_prefill_blocks - overlap_credit_blocks).max(0.0);
@@ -304,7 +472,21 @@ impl DefaultWorkerSelector {
             );
         }
 
-        logit
+        CandidateScore {
+            logit,
+            base_score: logit,
+            preferred_taint_multiplier: 1.0,
+            raw_prefill_blocks,
+            overlap_credit_blocks,
+            decode_cost_blocks,
+            active_request_cost_blocks,
+            device_overlap_blocks,
+            host_overlap_blocks,
+            disk_overlap_blocks,
+            shared_blocks_beyond: shared_beyond,
+            active_prefill_tokens: worker_load.active_prefill_tokens,
+            active_decode_blocks: worker_load.active_decode_blocks,
+        }
     }
 }
 
@@ -315,6 +497,17 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
         request: &SchedulingRequest,
         eligibility: RoutingEligibility<'_>,
         block_size: u32,
+    ) -> Result<WorkerSelectionResult, KvSchedulerError> {
+        self.select_worker_with_telemetry(workers, request, eligibility, block_size, None)
+    }
+
+    fn select_worker_with_telemetry(
+        &self,
+        workers: &HashMap<WorkerId, C>,
+        request: &SchedulingRequest,
+        eligibility: RoutingEligibility<'_>,
+        block_size: u32,
+        telemetry: Option<RouterSelectionTelemetry<'_>>,
     ) -> Result<WorkerSelectionResult, KvSchedulerError> {
         assert!(request.isl_tokens > 0);
         eligibility.validate_pinned_worker_allowed()?;
@@ -374,7 +567,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             }
 
             let min_active_prefill_tokens = request.worker_load_for(worker).active_prefill_tokens;
-            let logit = self.worker_logit(
+            let score = self.worker_logit(
                 request,
                 worker,
                 block_size,
@@ -391,9 +584,13 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 self.worker_type,
                 worker.worker_id,
                 worker.dp_rank,
-                logit,
+                score.logit,
                 effective_overlap_blocks,
             );
+
+            if let Some(telemetry) = telemetry {
+                telemetry.record_kv_aware(&[(worker, score)], worker, score, self.worker_type);
+            }
 
             return Ok(WorkerSelectionResult {
                 worker,
@@ -421,8 +618,8 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             } else {
                 0
             };
-        let get_score = |worker: WorkerWithDpRank| -> f64 {
-            let base_score = self.worker_logit(
+        let get_score = |worker: WorkerWithDpRank| -> CandidateScore {
+            let mut score = self.worker_logit(
                 request,
                 worker,
                 block_size,
@@ -431,7 +628,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 "Formula",
             );
             let Some(config) = workers.get(&worker.worker_id) else {
-                return base_score;
+                return score;
             };
             match request
                 .routing_constraints
@@ -439,34 +636,49 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             {
                 // NOTE: This multiplicative bias assumes a non-negative score. Negative
                 // overlap scores expose its pre-existing sign sensitivity; keep it for now.
-                Some(multiplier) => base_score * multiplier,
-                None => base_score,
+                Some(multiplier) => {
+                    score.preferred_taint_multiplier = multiplier;
+                    score.logit *= multiplier;
+                    score
+                }
+                None => score,
             }
         };
+
+        let candidate_scores = telemetry.as_ref().map(|_| {
+            let mut candidates = Vec::new();
+            eligibility.for_each_eligible_worker_rank(workers, |worker, _| {
+                candidates.push((worker, get_score(worker)));
+            });
+            candidates
+        });
 
         #[cfg(any(test, feature = "bench"))]
         let deterministic_choice = self.deterministic_rng.as_ref().map(|rng| {
             let mut candidates = Vec::new();
-            eligibility.for_each_eligible_worker_rank(workers, |worker, _| {
-                candidates.push(worker);
-            });
-            candidates.sort_unstable_by_key(|worker| (worker.worker_id, worker.dp_rank));
+            if let Some(scores) = &candidate_scores {
+                candidates.extend(scores.iter().copied());
+            } else {
+                eligibility.for_each_eligible_worker_rank(workers, |worker, _| {
+                    candidates.push((worker, get_score(worker)));
+                });
+            }
+            candidates.sort_unstable_by_key(|(worker, _)| (worker.worker_id, worker.dp_rank));
 
             let mut rng = rng.lock();
             if temperature == 0.0 {
                 let mut best_worker = None;
                 let mut best_logit = f64::INFINITY;
                 let mut tie_count = 0usize;
-                for worker in candidates {
-                    let score = get_score(worker);
-                    if score < best_logit {
+                for (worker, score) in candidates {
+                    if score.logit < best_logit {
                         best_worker = Some(worker);
-                        best_logit = score;
+                        best_logit = score.logit;
                         tie_count = 1;
                         continue;
                     }
 
-                    if score == best_logit {
+                    if score.logit == best_logit {
                         tie_count += 1;
                         if rng.usize(0..tie_count) == 0 {
                             best_worker = Some(worker);
@@ -481,7 +693,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
 
             let entries = candidates
                 .into_iter()
-                .map(|worker| (worker, get_score(worker)))
+                .map(|(worker, score)| (worker, score.logit))
                 .collect();
             softmax_sample_entries(entries, temperature, rng.f64())
         });
@@ -491,8 +703,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 let mut best_worker = None;
                 let mut best_logit = f64::INFINITY;
                 let mut tie_count = 0usize;
-                eligibility.for_each_eligible_worker_rank(workers, |worker, _| {
-                    let score = get_score(worker);
+                let mut consider = |worker, score| {
                     if score < best_logit {
                         best_worker = Some(worker);
                         best_logit = score;
@@ -507,7 +718,16 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                             best_worker = Some(worker);
                         }
                     }
-                });
+                };
+                if let Some(scores) = &candidate_scores {
+                    for &(worker, score) in scores {
+                        consider(worker, score.logit);
+                    }
+                } else {
+                    eligibility.for_each_eligible_worker_rank(workers, |worker, _| {
+                        consider(worker, get_score(worker).logit);
+                    });
+                }
 
                 return (
                     best_worker.expect("eligible worker rank non-empty"),
@@ -515,11 +735,18 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 );
             }
 
-            let mut worker_logits = FxHashMap::default();
-            eligibility.for_each_eligible_worker_rank(workers, |worker, _| {
-                let score = get_score(worker);
-                worker_logits.insert(worker, score);
-            });
+            let worker_logits = if let Some(scores) = &candidate_scores {
+                scores
+                    .iter()
+                    .map(|(worker, score)| (*worker, score.logit))
+                    .collect()
+            } else {
+                let mut worker_logits = FxHashMap::default();
+                eligibility.for_each_eligible_worker_rank(workers, |worker, _| {
+                    worker_logits.insert(worker, get_score(worker).logit);
+                });
+                worker_logits
+            };
 
             softmax_sample(&worker_logits, temperature)
         };
@@ -527,6 +754,20 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
         let (best_worker, best_logit) = deterministic_choice.unwrap_or_else(random_choice);
         #[cfg(not(any(test, feature = "bench")))]
         let (best_worker, best_logit) = random_choice();
+
+        if let (Some(telemetry), Some(candidate_scores)) = (telemetry, candidate_scores.as_deref()) {
+            let selected_score = candidate_scores
+                .iter()
+                .find(|(worker, _)| *worker == best_worker)
+                .map(|(_, score)| *score)
+                .expect("selected worker must be among scored candidates");
+            telemetry.record_kv_aware(
+                candidate_scores,
+                best_worker,
+                selected_score,
+                self.worker_type,
+            );
+        }
 
         let best_host_pinned_overlap_blocks = request
             .overlap
@@ -1513,13 +1754,17 @@ mod tests {
         };
 
         assert_eq!(
-            selector.worker_logit(&request, worker, 16, 0, weights, "test"),
+            selector
+                .worker_logit(&request, worker, 16, 0, weights, "test")
+                .logit,
             7.0
         );
 
         request.track_prefill_tokens = false;
         assert_eq!(
-            selector.worker_logit(&request, worker, 16, 0, weights, "test"),
+            selector
+                .worker_logit(&request, worker, 16, 0, weights, "test")
+                .logit,
             5.0
         );
     }
@@ -1552,11 +1797,15 @@ mod tests {
         );
 
         assert_eq!(
-            default.worker_logit(&request, worker, 16, 0, weights, "test"),
+            default
+                .worker_logit(&request, worker, 16, 0, weights, "test")
+                .logit,
             100.0
         );
         assert_eq!(
-            weighted.worker_logit(&request, worker, 16, 0, weights, "test"),
+            weighted
+                .worker_logit(&request, worker, 16, 0, weights, "test")
+                .logit,
             228.0
         );
     }
@@ -1583,7 +1832,9 @@ mod tests {
         };
 
         assert_eq!(
-            selector.worker_logit(&request, worker, 16, 0, weights, "test"),
+            selector
+                .worker_logit(&request, worker, 16, 0, weights, "test")
+                .logit,
             7.0
         );
     }
