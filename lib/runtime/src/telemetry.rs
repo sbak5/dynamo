@@ -162,10 +162,13 @@ impl LifecycleStage {
 
     const fn component(self) -> &'static str {
         match self {
-            Self::RequestLifecycle | Self::RequestPreprocessing | Self::ResponseStreaming => "frontend",
+            Self::RequestLifecycle
+            | Self::RequestPreprocessing
+            | Self::RequestDispatch
+            | Self::ResponseStreaming => "frontend",
             Self::RouterQueue | Self::RouterSelection => "router",
-            Self::WorkerAdmission | Self::RequestDispatch | Self::WorkerOperationPrefill
-            | Self::WorkerOperationDecode | Self::ResponseStreamingPrefill
+            Self::WorkerAdmission | Self::WorkerOperationPrefill | Self::WorkerOperationDecode
+            | Self::ResponseStreamingPrefill
             | Self::ResponseStreamingDecode | Self::ResponseStreamingWorker => "worker",
             Self::KvTransfer => "kv_transfer",
             Self::EngineQueue => "engine",
@@ -214,7 +217,32 @@ impl LifecycleStage {
                 "dynamo.request.terminal.error" = tracing::field::Empty,
             ),
             Self::RequestPreprocessing => common_span!("request.preprocessing"),
-            Self::RouterQueue => common_span!("router.queue"),
+            Self::RouterQueue => tracing::info_span!(
+                target: "dynamo.request_lifecycle", "router.queue",
+                "dynamo.request.id" = %identity.request_id,
+                "dynamo.request.attempt" = 0_u64,
+                "dynamo.operation.id" = %identity.operation_id,
+                "dynamo.operation.role" = identity.role.as_str(),
+                "dynamo.lifecycle.schema" = LIFECYCLE_SCHEMA,
+                "dynamo.lifecycle.profile" = %identity.profile,
+                "dynamo.lifecycle.mode" = %identity.mode,
+                "dynamo.component" = self.component(),
+                "dynamo.instance.id" = instance_id(),
+                "dynamo.process.epoch" = process_epoch(),
+                "dynamo.lifecycle.identity.state" = identity.identity_state,
+                "dynamo.lifecycle.capture.state" = "recorded",
+                "dynamo.lifecycle.detail_schema" = "router_queue.v1",
+                "dynamo.router.queue.class" = tracing::field::Empty,
+                "dynamo.router.queue.policy" = tracing::field::Empty,
+                "dynamo.router.queue.depth.in" = tracing::field::Empty,
+                "dynamo.router.queue.depth.out" = tracing::field::Empty,
+                "dynamo.router.queue.deferred" = tracing::field::Empty,
+                "dynamo.router.queue.outcome" = tracing::field::Empty,
+                // Set only for terminal queue outcomes.  This stays a bounded
+                // local cause; the request.lifecycle terminal outcome remains
+                // the authoritative end-to-end request result.
+                "dynamo.router.queue.reason" = tracing::field::Empty,
+            ),
             Self::RouterSelection => tracing::info_span!(
                 target: "dynamo.request_lifecycle", "router.selection",
                 "dynamo.request.id" = %identity.request_id,
@@ -229,7 +257,14 @@ impl LifecycleStage {
                 "dynamo.process.epoch" = process_epoch(),
                 "dynamo.lifecycle.identity.state" = identity.identity_state,
                 "dynamo.lifecycle.capture.state" = "recorded",
+                "dynamo.lifecycle.detail_schema" = "router_selection.v1",
                 "dynamo.router.candidate.count" = tracing::field::Empty,
+                "dynamo.router.candidate.eligible.count" = tracing::field::Empty,
+                "dynamo.router.candidate.filtered.count" = tracing::field::Empty,
+                "dynamo.router.candidate.filtered.not_allowed" = tracing::field::Empty,
+                "dynamo.router.candidate.filtered.constraints" = tracing::field::Empty,
+                "dynamo.router.candidate.filtered.overloaded" = tracing::field::Empty,
+                "dynamo.router.candidate.filtered.unavailable" = tracing::field::Empty,
                 "dynamo.router.algorithm.id" = tracing::field::Empty,
                 "dynamo.router.algorithm.version" = tracing::field::Empty,
                 "dynamo.router.decision.schema" = tracing::field::Empty,
@@ -245,8 +280,45 @@ impl LifecycleStage {
                 "dynamo.router.candidates.detail_schema" = tracing::field::Empty,
                 "dynamo.router.candidates.top_k" = tracing::field::Empty,
             ),
-            Self::WorkerAdmission => common_span!("worker.admission"),
-            Self::RequestDispatch => common_span!("request.dispatch"),
+            Self::WorkerAdmission => tracing::info_span!(
+                target: "dynamo.request_lifecycle", "worker.admission",
+                "dynamo.request.id" = %identity.request_id,
+                "dynamo.request.attempt" = 0_u64,
+                "dynamo.operation.id" = %identity.operation_id,
+                "dynamo.operation.role" = identity.role.as_str(),
+                "dynamo.lifecycle.schema" = LIFECYCLE_SCHEMA,
+                "dynamo.lifecycle.profile" = %identity.profile,
+                "dynamo.lifecycle.mode" = %identity.mode,
+                "dynamo.component" = self.component(),
+                "dynamo.instance.id" = instance_id(),
+                "dynamo.process.epoch" = process_epoch(),
+                "dynamo.lifecycle.identity.state" = identity.identity_state,
+                "dynamo.lifecycle.capture.state" = "recorded",
+                "dynamo.lifecycle.detail_schema" = "admission.v1",
+                "dynamo.worker.admission.transport" = tracing::field::Empty,
+                "dynamo.worker.admission.payload.bytes" = tracing::field::Empty,
+                "dynamo.worker.admission.result" = tracing::field::Empty,
+            ),
+            Self::RequestDispatch => tracing::info_span!(
+                target: "dynamo.request_lifecycle", "request.dispatch",
+                "dynamo.request.id" = %identity.request_id,
+                "dynamo.request.attempt" = 0_u64,
+                "dynamo.operation.id" = %identity.operation_id,
+                "dynamo.operation.role" = identity.role.as_str(),
+                "dynamo.lifecycle.schema" = LIFECYCLE_SCHEMA,
+                "dynamo.lifecycle.profile" = %identity.profile,
+                "dynamo.lifecycle.mode" = %identity.mode,
+                "dynamo.component" = self.component(),
+                "dynamo.instance.id" = instance_id(),
+                "dynamo.process.epoch" = process_epoch(),
+                "dynamo.lifecycle.identity.state" = identity.identity_state,
+                "dynamo.lifecycle.capture.state" = "recorded",
+                "dynamo.lifecycle.detail_schema" = "dispatch.v1",
+                "dynamo.dispatch.destination.worker.id" = tracing::field::Empty,
+                "dynamo.dispatch.destination.dp.rank" = tracing::field::Empty,
+                "dynamo.dispatch.route" = tracing::field::Empty,
+                "dynamo.dispatch.result" = tracing::field::Empty,
+            ),
             Self::KvTransfer => common_span!("kv.transfer"),
             Self::EngineQueue => common_span!("engine.queue"),
             Self::WorkerOperationPrefill => common_span!("worker.operation.prefill"),
@@ -532,7 +604,7 @@ mod tests {
     }
 
     #[test]
-    fn enabled_trace_creates_a_fieldless_registered_span() {
+    fn enabled_trace_creates_a_registered_router_queue_schema() {
         let captured = Arc::new(Mutex::new(Vec::new()));
         let subscriber = tracing_subscriber::registry().with(CaptureLayer(captured.clone()));
         let _guard = tracing::subscriber::set_default(subscriber);
@@ -543,7 +615,7 @@ mod tests {
             [CapturedSpan {
                 name: "router.queue",
                 target: LIFECYCLE_TARGET,
-                field_count: 0,
+                field_count: 20,
             }]
         );
     }

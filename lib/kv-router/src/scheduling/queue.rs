@@ -20,7 +20,7 @@ use super::overlap_refresh::{
     NoopOverlapScoresRefresh, OverlapScoresRefresh, read_overlap_refresh_after, refresh_overlap,
 };
 use super::policy_config::{PolicyClassConfig, PolicyProfile};
-use super::policy_queue::{PolicyQueue, QueueSnapshot};
+use super::policy_queue::{PolicyQueue, PolicyQueueEntry, QueueLimitKind, QueueSnapshot};
 use super::prefill_load::{PrefillLoadEstimator, effective_prefill_tokens};
 use super::queue_admission::{
     AdmissionAction, AdmissionDecision, AdmissionTicket, ClassAdmissionAction,
@@ -941,6 +941,17 @@ impl<
         });
         #[cfg(not(feature = "runtime-protocols"))]
         let lifecycle_span = tracing::Span::none();
+        // This actor serializes enqueue/dequeue, so these are a consistent
+        // router-wide queue snapshot immediately before this request enters.
+        // The exit snapshot is recorded when `handle_update` removes it.
+        let queue_depth_in = self.pending_count.load(AtomicOrdering::Relaxed);
+        lifecycle_span.record("dynamo.router.queue.class", class.name.as_str());
+        lifecycle_span.record("dynamo.router.queue.policy", class.queue_policy.to_string());
+        lifecycle_span.record("dynamo.router.queue.depth.in", queue_depth_in as u64);
+        lifecycle_span.record("dynamo.router.queue.deferred", deferred);
+        // The OpenTelemetry tracing layer keeps the first value recorded for
+        // a field.  Leave `outcome` empty until this entry actually leaves
+        // the queue, so its exported value is its terminal local outcome.
         let queued = QueuedRequest {
             request,
             parent_span,
@@ -973,6 +984,20 @@ impl<
             ),
         };
         if let Err((rejection, queued)) = enqueue {
+            queued
+                .lifecycle_span
+                .record("dynamo.router.queue.depth.out", queue_depth_in as u64);
+            queued
+                .lifecycle_span
+                .record("dynamo.router.queue.outcome", "rejected");
+            queued.lifecycle_span.record(
+                "dynamo.router.queue.reason",
+                match rejection.limit_kind {
+                    QueueLimitKind::Requests => "request_limit",
+                    QueueLimitKind::RawIslTokens => "raw_isl_token_limit",
+                    QueueLimitKind::CachedTokens => "cached_token_limit",
+                },
+            );
             drop(queued.lifecycle_span);
             let made_ready = queued
                 .admission
@@ -1094,7 +1119,7 @@ impl<
                 .pending
                 .remove_deferred(queue_class_index, tracked.ticket.id)
             {
-                self.subtract_pending_counters(entry.class_index(), entry.snapshot());
+                self.release_cancelled_queue_entry(entry);
             } else {
                 ready_by_class
                     .entry(queue_class_index)
@@ -1117,7 +1142,7 @@ impl<
             debug_assert_eq!(removed.len(), tickets.len());
             removed_ready_head |= class_head_removed;
             for entry in removed {
-                self.subtract_pending_counters(class_index, entry.snapshot());
+                self.release_cancelled_queue_entry(entry);
             }
         }
         if !unmanaged_request_ids.is_empty() {
@@ -1132,7 +1157,7 @@ impl<
                     });
                 removed_ready_head |= class_head_removed;
                 for entry in removed {
-                    self.subtract_pending_counters(class_index, entry.snapshot());
+                    self.release_cancelled_queue_entry(entry);
                 }
             }
         }
@@ -1303,6 +1328,32 @@ impl<
         self.subtract_class_counters(class_index, snapshot);
     }
 
+    /// Finish a request that left the scheduler queue because its lifecycle
+    /// lease ended before admission.  The queue owns only this local outcome;
+    /// `request.lifecycle` independently records the authoritative terminal
+    /// request outcome (for example, `cancelled` or `timed_out`).
+    fn release_cancelled_queue_entry(&self, entry: PolicyQueueEntry<QueuedRequest>) {
+        let class_index = entry.class_index();
+        let snapshot = entry.snapshot();
+        let queue_depth_out = self
+            .pending_count
+            .load(AtomicOrdering::Relaxed)
+            .saturating_sub(1);
+        self.subtract_pending_counters(class_index, snapshot);
+        let queued = entry.into_payload();
+        queued
+            .lifecycle_span
+            .record("dynamo.router.queue.depth.out", queue_depth_out as u64);
+        queued
+            .lifecycle_span
+            .record("dynamo.router.queue.outcome", "cancelled");
+        queued.lifecycle_span.record(
+            "dynamo.router.queue.reason",
+            "request_lifecycle_ended_before_admission",
+        );
+        drop(queued.lifecycle_span);
+    }
+
     fn replace_pending_snapshot_counters(
         &self,
         class_index: usize,
@@ -1421,6 +1472,11 @@ impl<
                 lifecycle_span,
                 ..
             } = popped.into_payload();
+            lifecycle_span.record(
+                "dynamo.router.queue.depth.out",
+                current_pending_count.saturating_sub(1) as u64,
+            );
+            lifecycle_span.record("dynamo.router.queue.outcome", "admitted");
             drop(lifecycle_span);
             tracing::debug!(
                 policy_class = class.name,
