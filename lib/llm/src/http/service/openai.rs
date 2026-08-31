@@ -128,7 +128,9 @@ pub(super) fn get_body_limit() -> usize {
 pub type ErrorResponse = (StatusCode, Json<ErrorMessage>);
 
 fn terminal_outcome_for_error_response(response: &ErrorResponse) -> TerminalOutcome {
-    if response.0.is_client_error() {
+    // Queue admission uses Dynamo's overload status (529 by default), which
+    // is not an HTTP 4xx but is still an explicit client-visible rejection.
+    if response.0.is_client_error() || response.0 == overload_status_code() {
         TerminalOutcome::Rejected
     } else {
         TerminalOutcome::Failed
@@ -4805,6 +4807,10 @@ mod tests {
                 "current": 2048,
                 "limit": 1024,
             }))
+        );
+        assert_eq!(
+            terminal_outcome_for_error_response(&response),
+            TerminalOutcome::Rejected
         );
     }
 

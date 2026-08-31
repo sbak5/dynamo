@@ -70,15 +70,90 @@ struct CandidateScore {
     active_decode_blocks: usize,
 }
 
+/// Bounded accounting for the live candidate universe used by the built-in
+/// KV-aware selector. Counts are DP-rank candidates, matching the selected
+/// worker identity, rather than top-level worker processes.
+#[derive(Debug, Clone, Copy, Default)]
+struct CandidateFilterSummary {
+    eligible: usize,
+    not_allowed: usize,
+    constraints: usize,
+    overloaded: usize,
+    unavailable: usize,
+}
+
+impl CandidateFilterSummary {
+    fn count_worker<C: WorkerConfigLike>(
+        &mut self,
+        worker_id: WorkerId,
+        config: &C,
+        eligibility: RoutingEligibility<'_>,
+    ) {
+        let replicas = config.data_parallel_size() as usize;
+        if !eligibility.caller_allows_worker_id(worker_id) {
+            self.not_allowed += replicas;
+        } else if !eligibility.allows_worker_ignoring_overload(worker_id, config) {
+            self.constraints += replicas;
+        } else if eligibility.is_worker_overloaded(worker_id) {
+            self.overloaded += replicas;
+        } else {
+            self.eligible += replicas;
+        }
+    }
+
+    fn from_eligibility<C: WorkerConfigLike>(
+        workers: &HashMap<WorkerId, C>,
+        eligibility: RoutingEligibility<'_>,
+    ) -> Self {
+        let mut summary = Self::default();
+
+        if let Some(worker) = eligibility.pinned_worker() {
+            if let Some(config) = workers.get(&worker.worker_id) {
+                // A pin narrows the candidate universe to its exact DP rank.
+                // Reuse the classification above, then normalize it to one.
+                let before = summary;
+                summary.count_worker(worker.worker_id, config, eligibility);
+                let classified = Self {
+                    eligible: summary.eligible - before.eligible,
+                    not_allowed: summary.not_allowed - before.not_allowed,
+                    constraints: summary.constraints - before.constraints,
+                    overloaded: summary.overloaded - before.overloaded,
+                    unavailable: 0,
+                };
+                summary = Self {
+                    eligible: (classified.eligible > 0) as usize,
+                    not_allowed: (classified.not_allowed > 0) as usize,
+                    constraints: (classified.constraints > 0) as usize,
+                    overloaded: (classified.overloaded > 0) as usize,
+                    unavailable: 0,
+                };
+            } else {
+                summary.unavailable = 1;
+            }
+            return summary;
+        }
+
+        for (&worker_id, config) in workers {
+            summary.count_worker(worker_id, config, eligibility);
+        }
+        summary
+    }
+
+    fn filtered_count(self) -> usize {
+        self.not_allowed + self.constraints + self.overloaded + self.unavailable
+    }
+}
+
 /// Bounded KV-aware decision detail recorded on a lifecycle `router.selection`
 /// span.
 ///
 /// The selector only receives this recorder when lifecycle capture is enabled.
 /// Every mode records the selected worker and score summary. Investigation mode
-/// additionally records the best four candidates as a compact JSON array,
-/// including the scalar decomposition of each KV-aware score. Candidate
-/// identities and detail therefore remain bounded even for a large router
-/// fleet. This is deliberately not a generic plugin score contract.
+/// additionally records the best candidates plus the selected candidate as a
+/// compact JSON array, including the scalar decomposition of each KV-aware
+/// score. Candidate identities and detail therefore remain bounded even for a
+/// large router fleet. This is deliberately not a generic plugin score
+/// contract.
 pub struct RouterSelectionTelemetry<'a> {
     span: &'a tracing::Span,
     include_candidate_details: bool,
@@ -95,6 +170,7 @@ impl<'a> RouterSelectionTelemetry<'a> {
     fn record_kv_aware(
         &self,
         candidates: &[(WorkerWithDpRank, CandidateScore)],
+        filters: CandidateFilterSummary,
         selected_worker: WorkerWithDpRank,
         selected_score: CandidateScore,
         pool_role: &'static str,
@@ -116,6 +192,29 @@ impl<'a> RouterSelectionTelemetry<'a> {
 
         self.span
             .record("dynamo.router.candidate.count", candidates.len() as u64);
+        debug_assert_eq!(filters.eligible, candidates.len());
+        self.span
+            .record("dynamo.router.candidate.eligible.count", filters.eligible as u64);
+        self.span.record(
+            "dynamo.router.candidate.filtered.count",
+            filters.filtered_count() as u64,
+        );
+        self.span.record(
+            "dynamo.router.candidate.filtered.not_allowed",
+            filters.not_allowed as u64,
+        );
+        self.span.record(
+            "dynamo.router.candidate.filtered.constraints",
+            filters.constraints as u64,
+        );
+        self.span.record(
+            "dynamo.router.candidate.filtered.overloaded",
+            filters.overloaded as u64,
+        );
+        self.span.record(
+            "dynamo.router.candidate.filtered.unavailable",
+            filters.unavailable as u64,
+        );
         self.span
             .record("dynamo.router.algorithm.id", "kv_aware");
         self.span
@@ -146,17 +245,34 @@ impl<'a> RouterSelectionTelemetry<'a> {
                 "dynamo.router.candidates.detail_schema",
                 "kv_aware.v1",
             );
-            let details = ranked
+            let mut detail_candidates = ranked.iter().take(TOP_K).copied().collect::<Vec<_>>();
+            if !detail_candidates
                 .iter()
-                .take(TOP_K)
+                .any(|(worker, _)| *worker == selected_worker)
+            {
+                // Softmax may choose outside the best-K. Keep the decision
+                // auditable without expanding the bounded investigation
+                // payload: retain K-1 best candidates plus the chosen one.
+                detail_candidates.pop();
+                detail_candidates.push((selected_worker, selected_score));
+                detail_candidates.sort_unstable_by(|(left_worker, left_score), (right_worker, right_score)| {
+                    left_score
+                        .logit
+                        .total_cmp(&right_score.logit)
+                        .then_with(|| left_worker.cmp(right_worker))
+                });
+            }
+            let details = detail_candidates
+                .iter()
                 .map(|(worker, score)| {
                     format!(
                         concat!(
-                            r#"{{"worker_id":{},"dp_rank":{},"score":{:.6},"base_score":{:.6},"preferred_taint_multiplier":{:.6},"raw_prefill_blocks":{:.6},"overlap_credit_blocks":{:.6},"decode_cost_blocks":{:.6},"active_request_cost_blocks":{:.6},"device_overlap_blocks":{:.6},"host_overlap_blocks":{:.6},"disk_overlap_blocks":{:.6},"shared_blocks_beyond":{},"active_prefill_tokens":{},"active_decode_blocks":{}}}"#
+                            r#"{{"worker_id":{},"dp_rank":{},"score":{:.6},"selected":{},"base_score":{:.6},"preferred_taint_multiplier":{:.6},"raw_prefill_blocks":{:.6},"overlap_credit_blocks":{:.6},"decode_cost_blocks":{:.6},"active_request_cost_blocks":{:.6},"device_overlap_blocks":{:.6},"host_overlap_blocks":{:.6},"disk_overlap_blocks":{:.6},"shared_blocks_beyond":{},"active_prefill_tokens":{},"active_decode_blocks":{}}}"#
                         ),
                         worker.worker_id,
                         worker.dp_rank,
                         score.logit,
+                        *worker == selected_worker,
                         score.base_score,
                         score.preferred_taint_multiplier,
                         score.raw_prefill_blocks,
@@ -533,6 +649,9 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
         }
 
         let request_blocks = request.request_blocks(block_size);
+        let filter_summary = telemetry
+            .as_ref()
+            .map(|_| CandidateFilterSummary::from_eligibility(workers, eligibility));
         // Borrowed, never allocated; bridges the winner row to `[ROUTING] Best`.
         let request_id = request.mode.request_id().unwrap_or("-");
 
@@ -589,7 +708,13 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             );
 
             if let Some(telemetry) = telemetry {
-                telemetry.record_kv_aware(&[(worker, score)], worker, score, self.worker_type);
+                telemetry.record_kv_aware(
+                    &[(worker, score)],
+                    filter_summary.expect("telemetry must have candidate filters"),
+                    worker,
+                    score,
+                    self.worker_type,
+                );
             }
 
             return Ok(WorkerSelectionResult {
@@ -763,6 +888,7 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
                 .expect("selected worker must be among scored candidates");
             telemetry.record_kv_aware(
                 candidate_scores,
+                filter_summary.expect("telemetry must have candidate filters"),
                 best_worker,
                 selected_score,
                 self.worker_type,
