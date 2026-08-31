@@ -2566,6 +2566,8 @@ async fn chat_completions(
         let reasoning_dispatch_enabled = state.streaming_reasoning_dispatch_enabled();
         let mut reasoning_buffer: HashMap<u32, String> = HashMap::new();
         let mut dispatched_tool_ids: HashSet<String> = HashSet::new();
+        let streaming_lifecycle = lifecycle.clone();
+        let streaming_request_lifecycle = request_lifecycle.clone();
 
         // Optionally prepend extra SSE events before each regular chunk:
         //   - `event: tool_call_dispatch`  — complete tool call detected early (tool dispatch)
@@ -2573,6 +2575,7 @@ async fn chat_completions(
         let stream = async_stream::stream! {
             let mut stream = Box::pin(stream);
             let mut events: Vec<Result<Event, axum::Error>> = Vec::with_capacity(4);
+            let mut response_streaming = None;
 
             while let Some(mut response) = stream.next().await {
                 events.clear();
@@ -2593,8 +2596,16 @@ async fn chat_completions(
                 }
 
                 // Drop empty chunks from multi-byte token assembly.
+                // Empty chunks are transport artifacts, not a streaming boundary.
                 if response.data.as_ref().is_some_and(is_empty_stream_response) {
                     continue;
+                }
+
+                if response_streaming.is_none() {
+                    let _entered_request_lifecycle = streaming_request_lifecycle.enter();
+                    response_streaming = Some(
+                        streaming_lifecycle.start(LifecycleStage::ResponseStreaming),
+                    );
                 }
                 if tool_dispatch_enabled {
                     streaming_tool_dispatch_events(
@@ -2639,14 +2650,9 @@ async fn chat_completions(
             stream_handle,
             terminal.clone(),
         );
-        let response_streaming = {
-            let _entered_request_lifecycle = request_lifecycle.enter();
-            lifecycle.start(LifecycleStage::ResponseStreaming)
-        };
         let terminal = terminal.clone();
         let stream = async_stream::stream! {
             let _request_lifecycle = request_lifecycle;
-            let _response_streaming = response_streaming;
             let mut inner = Box::pin(stream);
             while let Some(item) = inner.next().await {
                 yield item;
