@@ -364,6 +364,18 @@ where
         );
         let tracker = request.tracker.clone();
         let request_context = request.context().clone();
+        let context_id = request.context().id().to_string();
+        let lifecycle = request
+            .get_optional::<LifecycleTrace>(LIFECYCLE_TRACE_CONTEXT_KEY)
+            .ok()
+            .flatten()
+            .map(|trace| trace.as_ref().clone())
+            .unwrap_or_else(|| LifecycleTrace::from_request_id(context_id));
+        let request_dispatch = lifecycle.start(LifecycleStage::RequestDispatch);
+        request_dispatch.record(
+            "dynamo.dispatch.route",
+            self.inner.router_mode().telemetry_label(),
+        );
         self.request_metrics
             .input_sequence_tokens
             .observe(request.token_ids.len() as f64);
@@ -375,20 +387,22 @@ where
             let target = target_constraint.expect("Direct routing requires an explicit target");
             cancel_on_stop(
                 request_context.as_ref(),
-                self.inner.direct_within_prepared(
-                    request,
-                    target.worker_id,
-                    None,
-                    |request, worker_id| {
-                        let occupancy = guard.retarget_worker(worker_id);
-                        let target = AffinityTarget::new(
-                            worker_id,
-                            target.dp_rank.filter(|_| worker_id == target.worker_id),
-                        );
-                        request.routing_mut().dp_rank = target.dp_rank;
-                        prepare(request, target).map(|metadata| (metadata, target, occupancy))
-                    },
-                ),
+                self.inner
+                    .direct_within_prepared(
+                        request,
+                        target.worker_id,
+                        None,
+                        |request, worker_id| {
+                            let occupancy = guard.retarget_worker(worker_id);
+                            let target = AffinityTarget::new(
+                                worker_id,
+                                target.dp_rank.filter(|_| worker_id == target.worker_id),
+                            );
+                            request.routing_mut().dp_rank = target.dp_rank;
+                            prepare(request, target).map(|metadata| (metadata, target, occupancy))
+                        },
+                    )
+                    .instrument(request_dispatch.clone()),
             )
             .await
             .and_then(|result| result)
@@ -398,13 +412,17 @@ where
             let metadata = match prepare(&mut request, target) {
                 Ok(metadata) => metadata,
                 Err(error) => {
+                    request_dispatch.record("dynamo.dispatch.result", "failed");
+                    drop(request_dispatch);
                     guard.abort().await;
                     return Err(error);
                 }
             };
             cancel_on_stop(
                 request_context.as_ref(),
-                self.inner.dispatch_exact(request, target.worker_id),
+                self.inner
+                    .dispatch_exact(request, target.worker_id)
+                    .instrument(request_dispatch.clone()),
             )
             .await
             .and_then(|result| result)
@@ -412,16 +430,14 @@ where
         } else if uses_occupancy {
             cancel_on_stop(
                 request_context.as_ref(),
-                self.inner.dispatch_preselected_prepared(
-                    request,
-                    initial_worker,
-                    |request, worker_id| {
+                self.inner
+                    .dispatch_preselected_prepared(request, initial_worker, |request, worker_id| {
                         let occupancy = guard.retarget_worker(worker_id);
                         let target = target_for_worker(worker_id);
                         request.routing_mut().dp_rank = target.dp_rank;
                         prepare(request, target).map(|metadata| (metadata, target, occupancy))
-                    },
-                ),
+                    })
+                    .instrument(request_dispatch.clone()),
             )
             .await
             .and_then(|result| result)
@@ -429,17 +445,19 @@ where
         } else {
             cancel_on_stop(
                 request_context.as_ref(),
-                self.inner.direct_within_prepared(
-                    request,
-                    initial_worker,
-                    lora_fallback.as_ref(),
-                    |request, worker_id| {
-                        let occupancy = guard.retarget_worker(worker_id);
-                        let target = target_for_worker(worker_id);
-                        request.routing_mut().dp_rank = target.dp_rank;
-                        prepare(request, target).map(|metadata| (metadata, target, occupancy))
-                    },
-                ),
+                self.inner
+                    .direct_within_prepared(
+                        request,
+                        initial_worker,
+                        lora_fallback.as_ref(),
+                        |request, worker_id| {
+                            let occupancy = guard.retarget_worker(worker_id);
+                            let target = target_for_worker(worker_id);
+                            request.routing_mut().dp_rank = target.dp_rank;
+                            prepare(request, target).map(|metadata| (metadata, target, occupancy))
+                        },
+                    )
+                    .instrument(request_dispatch.clone()),
             )
             .await
             .and_then(|result| result)
@@ -449,6 +467,15 @@ where
         let (metadata, target, final_occupancy, response_stream) = match dispatch_result {
             Ok(result) => result,
             Err(error) => {
+                request_dispatch.record(
+                    "dynamo.dispatch.result",
+                    if is_cancelled(&error) {
+                        "cancelled"
+                    } else {
+                        "failed"
+                    },
+                );
+                drop(request_dispatch);
                 let expected_target =
                     target_constraint.unwrap_or_else(|| target_for_worker(initial_worker));
                 if self.session_affinity_mode == SessionAffinityMode::Hard
@@ -465,6 +492,12 @@ where
                 return Err(error);
             }
         };
+        request_dispatch.record("dynamo.dispatch.destination.worker.id", target.worker_id);
+        if let Some(dp_rank) = target.dp_rank {
+            request_dispatch.record("dynamo.dispatch.destination.dp.rank", dp_rank as u64);
+        }
+        request_dispatch.record("dynamo.dispatch.result", "accepted");
+        drop(request_dispatch);
         guard.retarget_worker(target.worker_id);
         if let Some(telemetry) = device_aware_telemetry {
             let selection_survived_transport = target.worker_id == initial_worker;

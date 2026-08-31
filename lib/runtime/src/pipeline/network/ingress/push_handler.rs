@@ -620,16 +620,28 @@ where
         });
 
         let worker_admission = lifecycle.start(LifecycleStage::WorkerAdmission);
+        worker_admission.record("dynamo.worker.admission.transport", "tcp");
+        worker_admission.record(
+            "dynamo.worker.admission.payload.bytes",
+            payload.len() as u64,
+        );
 
         let ParsedRequest {
             request,
             response_connection_info,
             frontend_send_ts_ns,
             payload_codec,
-        } = self
+        } = match self
             .parse_and_build_request(payload)
             .instrument(worker_admission.clone())
-            .await?;
+            .await
+        {
+            Ok(parsed) => parsed,
+            Err(error) => {
+                worker_admission.record("dynamo.worker.admission.result", "rejected");
+                return Err(error);
+            }
+        };
 
         // Compute network transit time (T2 - T1) using cross-process wall-clock timestamps
         if let Some(t1_ns) = frontend_send_ts_ns {
@@ -648,6 +660,7 @@ where
         .instrument(worker_admission.clone())
         .await
         .map_err(|e| {
+            worker_admission.record("dynamo.worker.admission.result", "failed");
             if let Some(m) = self.metrics() {
                 m.error_counter
                     .with_label_values(&[work_handler::error_types::RESPONSE_STREAM])
@@ -655,6 +668,7 @@ where
             }
             PipelineError::Generic(format!("Failed to create response stream: {e}"))
         })?;
+        worker_admission.record("dynamo.worker.admission.result", "accepted");
 
         tracing::trace!("calling generate");
         drop(worker_admission);
@@ -665,7 +679,6 @@ where
             .get()
             .expect("segment not set")
             .generate(request)
-            .instrument(lifecycle.start(LifecycleStage::RequestDispatch))
             .instrument(worker_operation.clone())
             .await
             .map_err(|e| {

@@ -148,9 +148,11 @@ impl Drop for StreamingLifecycleTerminal {
 }
 
 fn terminal_outcome_for_error_response(response: &ErrorResponse) -> TerminalOutcome {
+    // Queue admission uses Dynamo's overload status (529 by default), which
+    // is not an HTTP 4xx but is still an explicit client-visible rejection.
     if response.0.as_u16() == 499 {
         TerminalOutcome::Cancelled
-    } else if response.0.is_client_error() {
+    } else if response.0.is_client_error() || response.0 == overload_status_code() {
         TerminalOutcome::Rejected
     } else {
         TerminalOutcome::Failed

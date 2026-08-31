@@ -608,7 +608,6 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for WorkerSelectionPolicy {
         &self,
         input: WorkerSelectionInput<'_, C>,
     ) -> Result<WorkerSelectionResult, KvSchedulerError> {
-        let telemetry = input.telemetry();
         let (workers, request, eligibility, block_size) = input.into_configured()?;
         let state = match &self.state {
             WorkerSelectionPolicyState::Default(picker) => {
@@ -626,7 +625,34 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for WorkerSelectionPolicy {
             request,
             eligibility,
             block_size,
-            telemetry,
+            None,
+        )
+    }
+
+    fn select_worker_with_lifecycle(
+        &self,
+        input: WorkerSelectionInput<'_, C>,
+        span: Option<&tracing::Span>,
+        investigation: bool,
+    ) -> Result<WorkerSelectionResult, KvSchedulerError> {
+        let (workers, request, eligibility, block_size) = input.into_configured()?;
+        let state = match &self.state {
+            WorkerSelectionPolicyState::Default(picker) => {
+                WorkerSelectionPolicyStateRef::Default(picker)
+            }
+            WorkerSelectionPolicyState::Custom(state) => {
+                WorkerSelectionPolicyStateRef::Custom(state)
+            }
+        };
+        select_worker_with_policy(
+            &self.kv_router_config,
+            self.worker_label,
+            state,
+            workers,
+            request,
+            eligibility,
+            block_size,
+            span.map(|span| super::RouterSelectionTelemetry::new(span, investigation)),
         )
     }
 }

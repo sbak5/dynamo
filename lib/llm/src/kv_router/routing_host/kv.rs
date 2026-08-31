@@ -406,6 +406,23 @@ where
         guard.start_dispatch(&phase_label);
         self.warn_if_output_replay_annotation_ignored(&request, &selection);
 
+        let lifecycle = request
+            .get_optional::<LifecycleTrace>(LIFECYCLE_TRACE_CONTEXT_KEY)
+            .ok()
+            .flatten()
+            .map(|trace| trace.as_ref().clone())
+            .unwrap_or_else(|| LifecycleTrace::from_request_id(context_id.clone()));
+        let request_dispatch = lifecycle.start(LifecycleStage::RequestDispatch);
+        request_dispatch.record(
+            "dynamo.dispatch.destination.worker.id",
+            selection.worker.worker_id,
+        );
+        request_dispatch.record(
+            "dynamo.dispatch.destination.dp.rank",
+            selection.worker.dp_rank as u64,
+        );
+        request_dispatch.record("dynamo.dispatch.route", "kv");
+
         let (mut backend_input, context) = request.into_parts();
         backend_input.routing_mut().dp_rank = Some(selection.worker.dp_rank);
         let _ = backend_input
@@ -458,10 +475,21 @@ where
         );
         let dispatch_result = cancel_on_stop(
             request_context.as_ref(),
-            dispatch.instrument(route_span.clone()),
+            dispatch
+                .instrument(route_span.clone())
+                .instrument(request_dispatch.clone()),
         )
         .await
         .and_then(|result| result);
+        request_dispatch.record(
+            "dynamo.dispatch.result",
+            match &dispatch_result {
+                Ok(_) => "accepted",
+                Err(error) if is_cancelled(error) => "cancelled",
+                Err(_) => "failed",
+            },
+        );
+        drop(request_dispatch);
         let response_stream = match dispatch_result {
             Ok(stream) => stream,
             Err(error) => {
