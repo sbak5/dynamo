@@ -35,19 +35,23 @@ LIFECYCLE_TEST_CASES="${LIFECYCLE_TEST_CASES:-}"
 LIFECYCLE_CANCEL_MAX_TIME_SECS="${LIFECYCLE_CANCEL_MAX_TIME_SECS:-0.25}"
 MOCKER_SPEEDUP_RATIO="${MOCKER_SPEEDUP_RATIO:-100}"
 FRONTEND_OTEL_FLUSH_DELAY_SECS="${FRONTEND_OTEL_FLUSH_DELAY_SECS:-6}"
+ROUTER_MODE="${ROUTER_MODE:-round-robin}"
+ROUTER_QUEUE_LIMIT_PER_WORKER="${ROUTER_QUEUE_LIMIT_PER_WORKER:-1}"
+# Keep iterative artifacts and wheelhouses on scratch: /home/sbak can be full.
+REPRO_ROOT="${REPRO_ROOT:-$HOME/scratch/dynamo_repro}"
 HOST_HOME="$HOME"
-RUN_DIR="$HOST_HOME/dynamo_repro/lifecycle_mock_runs/$RUN_ID"
+RUN_DIR="$REPRO_ROOT/lifecycle_mock_runs/$RUN_ID"
 LOGDIR="$RUN_DIR/logs"
-OTELCOL_BIN="${OTELCOL_BIN:-$HOST_HOME/dynamo_repro/tools/otelcol-contrib-0.122.1-linux-arm64/otelcol-contrib}"
-OTELCOL_TEMPLATE="${OTELCOL_TEMPLATE:-$HOST_HOME/scratch/dynamo-lifecycle-dev/launch/kv-router-routing-analysis/launch/lifecycle-otel-jsonl.yaml}"
+OTELCOL_BIN="${OTELCOL_BIN:-$REPRO_ROOT/tools/otelcol-contrib-0.122.1-linux-arm64/otelcol-contrib}"
+OTELCOL_TEMPLATE="${OTELCOL_TEMPLATE:-$HOME/scratch/dynamo-lifecycle-dev/launch/kv-router-routing-analysis/launch/lifecycle-otel-jsonl.yaml}"
 OTELCOL_CONFIG="$RUN_DIR/otelcol.yaml"
 OTEL_TRACES_FILE="$LOGDIR/otel-traces.jsonl"
 OTEL_LOGS_FILE="$LOGDIR/otel-logs.jsonl"
 mkdir -p "$LOGDIR"
 
-export IMAGE WHEELHOUSE_NAME RUN_ID MODEL_NAME MODEL_PATH HOST_HOME RUN_DIR LOGDIR
+export IMAGE WHEELHOUSE_NAME RUN_ID MODEL_NAME MODEL_PATH REPRO_ROOT RUN_DIR LOGDIR
 export LIFECYCLE_TEST_CASES LIFECYCLE_CANCEL_MAX_TIME_SECS MOCKER_SPEEDUP_RATIO
-export FRONTEND_OTEL_FLUSH_DELAY_SECS
+export FRONTEND_OTEL_FLUSH_DELAY_SECS ROUTER_MODE ROUTER_QUEUE_LIMIT_PER_WORKER
 export DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS="${DYN_HTTP_BACKEND_STREAM_TIMEOUT_SECS:-}"
 # The `timed_out` probe pauses a worker before its first response, exercising
 # the request-plane timeout rather than the post-SSE inactivity monitor.
@@ -60,7 +64,7 @@ export OTEL_EXPORTER_OTLP_TRACES_INSECURE="${OTEL_EXPORTER_OTLP_TRACES_INSECURE:
 export OTEL_TRACES_SAMPLE_RATIO="${OTEL_TRACES_SAMPLE_RATIO:-1.0}"
 
 stage_logs() {
-  local dest="$HOST_HOME/scratch/dynamo_repro/completed_runs/$RUN_ID"
+  local dest="$REPRO_ROOT/completed_runs/$RUN_ID"
   mkdir -p "$dest"
   rsync -a "$RUN_DIR/" "$dest/" || true
   printf 'run_id=%s\nstaged_at_utc=%s\nsource=%s\n' "$RUN_ID" "$(date -u +%FT%TZ)" "$RUN_DIR" > "$dest/STAGED.txt"
@@ -100,14 +104,14 @@ echo "[lifecycle-mock] OTel Collector pid=$OTELCOL_PID otlp=$OTEL_EXPORTER_OTLP_
 # makes the inner test fail. The final exit status still reflects that test.
 set +e
 srun --nodes=1 --ntasks=1 --container-image="$IMAGE" \
-  --container-mounts="$HOST_HOME:$HOST_HOME" --container-remap-root --export=ALL \
+  --container-mounts="$HOST_HOME:$HOST_HOME,$REPRO_ROOT:$REPRO_ROOT" --container-remap-root --export=ALL \
   bash -s <<'INNER'
 set -euo pipefail
 
 STAGING_LOGDIR="/tmp/dynamo-lifecycle-logs-$SLURM_JOB_ID"
 mkdir -p "$STAGING_LOGDIR"
 
-wheelhouse="$HOST_HOME/dynamo_repro/wheelhouse-$WHEELHOUSE_NAME"
+wheelhouse="$REPRO_ROOT/wheelhouses/$WHEELHOUSE_NAME"
 [ -d "$wheelhouse" ] || { echo "missing wheelhouse: $wheelhouse" >&2; exit 2; }
 pip install --break-system-packages --force-reinstall --no-deps \
   "$wheelhouse"/ai_dynamo_runtime*.whl "$wheelhouse"/ai_dynamo-*any.whl
@@ -131,6 +135,27 @@ export DYN_TCP_REQUEST_TIMEOUT
 export OTEL_EXPORT_ENABLED OTEL_EXPORTER_OTLP_TRACES_ENDPOINT OTEL_EXPORTER_OTLP_TRACES_PROTOCOL
 export OTEL_EXPORTER_OTLP_TRACES_INSECURE OTEL_TRACES_SAMPLE_RATIO
 
+if [ "$ROUTER_MODE" = "kv" ]; then
+  # One admitted request occupies the only worker; exactly one subsequent
+  # request may wait, and the next request is rejected by the scheduler. This
+  # is deliberately a development-only negative-path fixture.
+  cat >"$STAGING_LOGDIR/router-policy.yaml" <<EOF
+default_policy_family: lifecycle_fixture
+uncached_isl_buckets:
+  - min_tokens: 0
+    bucket: all
+policy_classes:
+  - name: lifecycle_fixture
+    policy_family: lifecycle_fixture
+    cache_bucket: all
+    queue_policy: fcfs
+    quantum: 1
+    prefill_busy_threshold: 0
+    request_queue_limit_per_worker: $ROUTER_QUEUE_LIMIT_PER_WORKER
+EOF
+  export DYN_ROUTER_POLICY_CONFIG="$STAGING_LOGDIR/router-policy.yaml"
+fi
+
 etcd --data-dir "/tmp/dynamo-lifecycle-etcd-$SLURM_JOB_ID" \
   --listen-client-urls http://127.0.0.1:2379 \
   --advertise-client-urls http://127.0.0.1:2379 >"$STAGING_LOGDIR/etcd.log" 2>&1 &
@@ -138,7 +163,7 @@ ETCD_PID=$!
 nats-server -js -a 127.0.0.1 -p 4222 >"$STAGING_LOGDIR/nats.log" 2>&1 &
 NATS_PID=$!
 
-python3 -m dynamo.frontend --http-port 8000 --router-mode round-robin \
+python3 -m dynamo.frontend --http-port 8000 --router-mode "$ROUTER_MODE" \
   >"$STAGING_LOGDIR/frontend.log" 2>&1 &
 FRONTEND_PID=$!
 
@@ -166,6 +191,65 @@ curl --fail --silent --show-error --no-buffer \
   >"$STAGING_LOGDIR/response.jsonl"
 
 grep -q 'data:' "$STAGING_LOGDIR/response.jsonl"
+
+# Queue negative-path fixture: keep one request on the only worker, queue a
+# second request, issue a third to hit the one-request queue limit, then close
+# the queued client. The scheduler must produce bounded `rejected` and
+# `cancelled` router.queue outcomes, each agreeing with the corresponding
+# request.lifecycle terminal outcome.
+case ",$LIFECYCLE_TEST_CASES," in
+  *,queue_rejected,*|*,queue_cancelled,*)
+    [ "$ROUTER_MODE" = "kv" ] || {
+      echo "queue probes require ROUTER_MODE=kv" >&2
+      exit 1
+    }
+    curl --fail --silent --show-error --no-buffer \
+      -H 'content-type: application/json' \
+      http://127.0.0.1:8000/v1/chat/completions \
+      -d "{\"model\":\"$MODEL_NAME\",\"messages\":[{\"role\":\"user\",\"content\":\"queue blocker\"}],\"max_tokens\":8192,\"stream\":true}" \
+      >"$STAGING_LOGDIR/queue-blocker-response.jsonl" &
+    QUEUE_BLOCKER_PID=$!
+    for _ in $(seq 1 100); do
+      grep -q 'data:' "$STAGING_LOGDIR/queue-blocker-response.jsonl" 2>/dev/null && break
+      kill -0 "$QUEUE_BLOCKER_PID" 2>/dev/null || break
+      sleep 0.05
+    done
+    grep -q 'data:' "$STAGING_LOGDIR/queue-blocker-response.jsonl" || {
+      echo "queue blocker did not receive its first chunk" >&2
+      exit 1
+    }
+    curl --silent --show-error --no-buffer \
+      -H 'content-type: application/json' \
+      http://127.0.0.1:8000/v1/chat/completions \
+      -d "{\"model\":\"$MODEL_NAME\",\"messages\":[{\"role\":\"user\",\"content\":\"queued cancellation\"}],\"max_tokens\":4,\"stream\":true}" \
+      >"$STAGING_LOGDIR/queue-cancelled-response.jsonl" &
+    QUEUE_CANCELLED_PID=$!
+    sleep 1
+    case ",$LIFECYCLE_TEST_CASES," in
+      *,queue_rejected,*)
+        queue_rejection_status=$(curl --silent --show-error --output "$STAGING_LOGDIR/queue-rejected-response.json" \
+          --write-out '%{http_code}' \
+          -H 'content-type: application/json' \
+          http://127.0.0.1:8000/v1/chat/completions \
+          -d "{\"model\":\"$MODEL_NAME\",\"messages\":[{\"role\":\"user\",\"content\":\"queue rejection\"}],\"max_tokens\":4,\"stream\":false}")
+        case "$queue_rejection_status" in
+          4*|5*) echo "[lifecycle-mock] injected scheduler queue rejection: HTTP $queue_rejection_status" ;;
+          *) echo "expected scheduler queue rejection, got HTTP $queue_rejection_status" >&2; exit 1 ;;
+        esac
+        ;;
+    esac
+    case ",$LIFECYCLE_TEST_CASES," in
+      *,queue_cancelled,*)
+        kill -TERM "$QUEUE_CANCELLED_PID" 2>/dev/null || true
+        wait "$QUEUE_CANCELLED_PID" 2>/dev/null || true
+        # The cleanup channel is drained by the scheduler actor; leave enough
+        # time for it and the root terminal span to complete before shutdown.
+        sleep 3
+        echo "[lifecycle-mock] injected cancellation while queued"
+        ;;
+    esac
+    ;;
+esac
 
 # An unknown model reaches the frontend request lifecycle but is rejected
 # before a backend response is delivered. It exercises the `rejected` path.

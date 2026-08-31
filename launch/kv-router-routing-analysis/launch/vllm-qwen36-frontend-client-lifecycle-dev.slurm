@@ -27,6 +27,13 @@ WHEELHOUSE_ROOT="${WHEELHOUSE_ROOT:-$RUNS_ROOT/wheelhouses}"
 STAGE_ROOT="${STAGE_ROOT:-$HOME/scratch/dynamo_repro/completed_runs}"
 CLIENT_CONCURRENCY="${CLIENT_CONCURRENCY:-1}"
 CLIENT_REQUESTS="${CLIENT_REQUESTS:-4}"
+# Empty by default: production-comparable validation continues to run AIPerf.
+# An opt-in probe is used only for lifecycle negative-path development.
+CLIENT_PROBE_SCRIPT="${CLIENT_PROBE_SCRIPT:-}"
+# When set, materialize a bounded one-request-per-worker policy on the shared
+# run directory. This is used with CLIENT_PROBE_SCRIPT to exercise scheduler
+# queue rejection without changing the ordinary routing workload.
+ROUTER_QUEUE_LIMIT_PER_WORKER="${ROUTER_QUEUE_LIMIT_PER_WORKER:-}"
 # Slurm copies batch scripts to its spool directory, so `$0` cannot locate
 # companion collector/nginx files. The submitter supplies this stable source
 # directory for lifecycle development runs.
@@ -47,7 +54,14 @@ model_source_pid=
 collector_pid=
 mkdir -p "$SHARED" "$LOGDIR"
 rm -f "$SHARED"/{infra_ip.txt,frontend_ready,prefill_workers_ready,decode_workers_ready,prefill_workers_done,decode_workers_done,model_source_ready,model_source_endpoint.txt,model_source_files.tsv,otel_collector_ready,otel_collector_endpoint.txt,stop_workers}
-export IMAGE MODEL RUN_ID HOST_HOME RUNS_ROOT RUN_DIR SHARED LOGDIR WHEELHOUSE_NAME WHEELHOUSE_ROOT STAGE_ROOT CLIENT_CONCURRENCY CLIENT_REQUESTS MODEL_SOURCE_IMAGE MODEL_SOURCE_DIR MODEL_SOURCE_CONFIG MODEL_SOURCE_PORT OTELCOL_BIN OTELCOL_TEMPLATE OTELCOL_CONFIG OTEL_TRACES_FILE OTEL_LOGS_FILE DYN_LIFECYCLE_TRACE_ENABLED DYN_LIFECYCLE_TRACE_MODE
+if [ -n "$CLIENT_PROBE_SCRIPT" ]; then
+  test -f "$CLIENT_PROBE_SCRIPT"
+  # $SHARED is under RUNS_ROOT, which every client container explicitly mounts.
+  # The worktree itself need not be mounted into a Slurm-spooled client step.
+  cp "$CLIENT_PROBE_SCRIPT" "$SHARED/lifecycle-client-probe.sh"
+  CLIENT_PROBE_SCRIPT="$SHARED/lifecycle-client-probe.sh"
+fi
+export IMAGE MODEL RUN_ID HOST_HOME RUNS_ROOT RUN_DIR SHARED LOGDIR WHEELHOUSE_NAME WHEELHOUSE_ROOT STAGE_ROOT CLIENT_CONCURRENCY CLIENT_REQUESTS CLIENT_PROBE_SCRIPT ROUTER_QUEUE_LIMIT_PER_WORKER MODEL_SOURCE_IMAGE MODEL_SOURCE_DIR MODEL_SOURCE_CONFIG MODEL_SOURCE_PORT OTELCOL_BIN OTELCOL_TEMPLATE OTELCOL_CONFIG OTEL_TRACES_FILE OTEL_LOGS_FILE DYN_LIFECYCLE_TRACE_ENABLED DYN_LIFECYCLE_TRACE_MODE
 
 stage_logs() {
   local dest="$STAGE_ROOT/$RUN_ID"
@@ -102,6 +116,25 @@ export OTEL_ENDPOINT OTEL_EXPORT_ENABLED="${OTEL_EXPORT_ENABLED:-true}" \
   OTEL_EXPORTER_OTLP_TRACES_ENDPOINT="$OTEL_ENDPOINT" \
   OTEL_TRACES_SAMPLE_RATIO="${OTEL_TRACES_SAMPLE_RATIO:-1.0}"
 
+if [ -n "$ROUTER_QUEUE_LIMIT_PER_WORKER" ]; then
+  case "$ROUTER_QUEUE_LIMIT_PER_WORKER" in *[!0-9]*|'') echo "invalid ROUTER_QUEUE_LIMIT_PER_WORKER" >&2; exit 2;; esac
+  cat >"$SHARED/router-policy.yaml" <<EOF
+default_policy_family: lifecycle_fixture
+uncached_isl_buckets:
+  - min_tokens: 0
+    bucket: all
+policy_classes:
+  - name: lifecycle_fixture
+    policy_family: lifecycle_fixture
+    cache_bucket: all
+    queue_policy: fcfs
+    quantum: 1
+    prefill_busy_threshold: 0
+    request_queue_limit_per_worker: $ROUTER_QUEUE_LIMIT_PER_WORKER
+EOF
+  export DYN_ROUTER_POLICY_CONFIG="$SHARED/router-policy.yaml"
+fi
+
 srun --overlap --nodes=1 --ntasks=1 --container-image="$MODEL_SOURCE_IMAGE" \
   --container-mounts="$MODEL_SOURCE_DIR:/models:ro,$MODEL_SOURCE_CONFIG:/etc/nginx/nginx.conf:ro" \
   --container-remap-root --export=ALL /usr/sbin/nginx -g 'daemon off;' >"$LOGDIR/model-source-nginx.log" 2>&1 &
@@ -151,7 +184,12 @@ aiperf() { PYTHONPATH=/tmp/aiperf-site python -m aiperf "$@"; }
 until [ -e "$SHARED/prefill_workers_ready" ] && [ -e "$SHARED/decode_workers_ready" ]; do sleep 2; done
 until curl -sf "http://$INFRA_IP:8000/v1/models" | grep -q "$MODEL"; do sleep 3; done
 mkdir -p "$LOGDIR/aiperf"
-aiperf profile --model "$MODEL" --url "http://$INFRA_IP:8000" --endpoint-type chat --streaming --concurrency "$CLIENT_CONCURRENCY" --request-count "$CLIENT_REQUESTS" --synthetic-input-tokens-mean 64 --output-tokens-mean 16 --artifact-dir "$LOGDIR/aiperf" >"$LOGDIR/client.log" 2>&1
+if [ -n "$CLIENT_PROBE_SCRIPT" ]; then
+  test -f "$CLIENT_PROBE_SCRIPT"
+  bash "$CLIENT_PROBE_SCRIPT" >"$LOGDIR/client.log" 2>&1
+else
+  aiperf profile --model "$MODEL" --url "http://$INFRA_IP:8000" --endpoint-type chat --streaming --concurrency "$CLIENT_CONCURRENCY" --request-count "$CLIENT_REQUESTS" --synthetic-input-tokens-mean 64 --output-tokens-mean 16 --artifact-dir "$LOGDIR/aiperf" >"$LOGDIR/client.log" 2>&1
+fi
 CLIENT
 client_status=$?
 set -e
