@@ -296,16 +296,35 @@ impl<'a> RouterSelectionTelemetry<'a> {
             const TOP_K: usize = 4;
             self.span
                 .record("dynamo.router.candidates.detail_schema", "kv_aware.v1");
-            let details = ranked
+            let mut detailed = ranked.iter().take(TOP_K).copied().collect::<Vec<_>>();
+            if !detailed
                 .iter()
-                .take(TOP_K)
+                .any(|(worker, _)| *worker == selected_worker)
+            {
+                if let Some(selected) = ranked
+                    .iter()
+                    .find(|(worker, _)| *worker == selected_worker)
+                    .copied()
+                {
+                    detailed.pop();
+                    detailed.push(selected);
+                    detailed.sort_unstable_by(|(left_worker, left), (right_worker, right)| {
+                        left.cost
+                            .total_cmp(&right.cost)
+                            .then_with(|| left_worker.cmp(right_worker))
+                    });
+                }
+            }
+            let details = detailed
+                .iter()
                 .map(|(worker, score)| {
                     format!(
                         concat!(
-                            r#"{{"worker_id":{},"dp_rank":{},"score":{:.6},"base_score":{:.6},"preferred_taint_multiplier":{:.6},"raw_prefill_blocks":{:.6},"overlap_credit_blocks":{:.6},"decode_cost_blocks":{:.6},"active_request_cost_blocks":{:.6},"device_overlap_blocks":{:.6},"host_overlap_blocks":{:.6},"disk_overlap_blocks":{:.6},"shared_blocks_beyond":{},"active_prefill_tokens":{},"active_decode_blocks":{}}}"#
+                            r#"{{"worker_id":{},"dp_rank":{},"selected":{},"score":{:.6},"base_score":{:.6},"preferred_taint_multiplier":{:.6},"raw_prefill_blocks":{:.6},"overlap_credit_blocks":{:.6},"decode_cost_blocks":{:.6},"active_request_cost_blocks":{:.6},"device_overlap_blocks":{:.6},"host_overlap_blocks":{:.6},"disk_overlap_blocks":{:.6},"shared_blocks_beyond":{},"active_prefill_tokens":{},"active_decode_blocks":{}}}"#
                         ),
                         worker.worker_id,
                         worker.dp_rank,
+                        *worker == selected_worker,
                         score.cost,
                         score.base_cost,
                         score.preferred_taint_multiplier,
