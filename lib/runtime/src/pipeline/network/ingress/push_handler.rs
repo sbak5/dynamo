@@ -715,8 +715,7 @@ where
                     self.segment
                         .get()
                         .expect("segment not set")
-                        .generate(request)
-                        .instrument(lifecycle.start(LifecycleStage::RequestDispatch)),
+                        .generate(request),
                 )
                 .await
         }
@@ -843,6 +842,7 @@ where
             }
         });
 
+        let payload_bytes = payload.len() as u64;
         let (control_msg, data) = self.decode_control_message(payload)?;
         let lifecycle = match self.registered_lifecycle_role() {
             Some(role)
@@ -861,16 +861,19 @@ where
         // readers capture the current span and live until the request ends.
         // They must inherit handle_payload, not prolong worker.admission.
         let worker_admission = lifecycle.start(LifecycleStage::WorkerAdmission);
-        worker_admission.record("dynamo.worker.admission.payload.bytes", payload.len() as u64);
+        worker_admission.record("dynamo.worker.admission.payload.bytes", payload_bytes);
         let ParsedRequest {
             request,
             response_connection_info,
             frontend_send_ts_ns,
             payload_codec,
-        } = self.parse_and_build_request(control_msg, data).await.map_err(|error| {
-            worker_admission.record("dynamo.worker.admission.result", "rejected");
-            error
-        })?;
+        } = self
+            .parse_and_build_request(control_msg, data)
+            .await
+            .map_err(|error| {
+                worker_admission.record("dynamo.worker.admission.result", "rejected");
+                error
+            })?;
 
         // Compute network transit time (T2 - T1) using cross-process wall-clock timestamps
         if let Some(t1_ns) = frontend_send_ts_ns {
@@ -935,7 +938,7 @@ where
                     )
                     .await
                     .map_err(|error| {
-                    worker_admission.record("dynamo.worker.admission.result", "failed");
+                        worker_admission.record("dynamo.worker.admission.result", "failed");
                         if let Some(metrics) = self.metrics() {
                             metrics
                                 .error_counter

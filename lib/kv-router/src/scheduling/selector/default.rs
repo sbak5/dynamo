@@ -8,11 +8,13 @@ use std::sync::Arc;
 
 use parking_lot::Mutex;
 
+#[cfg(feature = "runtime-protocols")]
+use super::current_router_selection_telemetry;
 use super::policy::WorkerSelectionPolicyStateRef;
 use super::{
     CandidateFilterSummary, DefaultCandidateScore, LogitWeights, MaterializedSelectionInput,
-    RouterSelectionTelemetry, WorkerCandidate, WorkerInputs, WorkerSelectionContext, WorkerSelectionInput, WorkerSelector,
-    select_worker_with_policy,
+    RouterSelectionTelemetry, WorkerCandidate, WorkerInputs, WorkerSelectionContext,
+    WorkerSelectionInput, WorkerSelector, select_worker_with_policy,
 };
 use crate::protocols::{WorkerConfigLike, WorkerId, WorkerSelectionResult, WorkerWithDpRank};
 use crate::scheduling::config::KvRouterConfig;
@@ -573,22 +575,41 @@ pub(super) fn pick_default_worker<C: WorkerConfigLike>(
     workers: &HashMap<WorkerId, C>,
     request: &SchedulingRequest,
     eligibility: RoutingEligibility<'_>,
-    telemetry: Option<RouterSelectionTelemetry<'_>>,
-    filter_summary: Option<CandidateFilterSummary>,
+    evidence: Option<(RouterSelectionTelemetry<'_>, CandidateFilterSummary)>,
 ) -> Option<(WorkerWithDpRank, f64)> {
     let selected = pick_default_worker_inner(scorer, picker, input, workers, request, eligibility);
     let (selected_worker, _) = selected?;
-    let Some(telemetry) = telemetry else {
+    let Some((telemetry, filter_summary)) = evidence else {
         return selected;
     };
 
+    let candidates = collect_default_candidate_scores(scorer, input, workers, request, eligibility);
+    let selected_score = candidates
+        .iter()
+        .find(|(worker, _)| *worker == selected_worker)
+        .map(|(_, score)| *score)
+        .expect("selected worker must be among eligible candidates");
+    telemetry.record_kv_aware(
+        &candidates,
+        filter_summary,
+        selected_worker,
+        selected_score,
+        scorer.worker_type,
+    );
+    selected
+}
+
+fn collect_default_candidate_scores<C: WorkerConfigLike>(
+    scorer: &DefaultWorkerScorer<&KvRouterConfig>,
+    input: &MaterializedSelectionInput<'_>,
+    workers: &HashMap<WorkerId, C>,
+    request: &SchedulingRequest,
+    eligibility: RoutingEligibility<'_>,
+) -> Vec<(WorkerWithDpRank, DefaultCandidateScore)> {
     let default_context =
         DefaultScoringContext::new(workers, request, eligibility, input.context.weights);
     let mut candidates = Vec::new();
-    let mut collect = |worker: WorkerWithDpRank, config: &C| {
-        let multiplier = request
-            .routing_constraints
-            .preferred_taint_multiplier(config.taints());
+    let mut collect = |worker: WorkerWithDpRank, multiplier: Option<f64>| {
         let row = default_row(input, default_context, worker, multiplier);
         let mut score =
             scorer.worker_score(&input.context, default_context, &row, "Telemetry formula");
@@ -599,26 +620,20 @@ pub(super) fn pick_default_worker<C: WorkerConfigLike>(
         candidates.push((worker, score));
     };
     if let Some(pinned) = eligibility.pinned_worker() {
-        if let Some(config) = workers.get(&pinned.worker_id) {
-            collect(pinned, config);
+        if workers.contains_key(&pinned.worker_id) {
+            // Pinning bypasses preferred-taint scoring in selection, so its
+            // evidence must preserve the same unmodified score.
+            collect(pinned, None);
         }
     } else {
-        eligibility
-            .for_each_eligible_worker_rank(workers, |worker, config| collect(worker, config));
+        eligibility.for_each_eligible_worker_rank(workers, |worker, config| {
+            let multiplier = request
+                .routing_constraints
+                .preferred_taint_multiplier(config.taints());
+            collect(worker, multiplier);
+        });
     }
-    let selected_score = candidates
-        .iter()
-        .find(|(worker, _)| *worker == selected_worker)
-        .map(|(_, score)| *score)
-        .expect("selected worker must be among eligible candidates");
-    telemetry.record_kv_aware(
-        &candidates,
-        filter_summary.expect("telemetry includes candidate accounting"),
-        selected_worker,
-        selected_score,
-        scorer.worker_type,
-    );
-    selected
+    candidates
 }
 
 impl DefaultWorkerPicker {
@@ -648,34 +663,25 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
         input: WorkerSelectionInput<'_, C>,
     ) -> Result<WorkerSelectionResult, KvSchedulerError> {
         let (workers, request, eligibility, block_size) = input.into_configured()?;
+        #[cfg(feature = "runtime-protocols")]
+        let telemetry_state = current_router_selection_telemetry();
+        #[cfg(feature = "runtime-protocols")]
+        let telemetry = telemetry_state
+            .as_ref()
+            .map(|(span, investigation)| RouterSelectionTelemetry::new(span, *investigation));
+        #[cfg(not(feature = "runtime-protocols"))]
+        let telemetry = None;
         select_worker_with_policy(
-            &self.kv_router_config,
-            self.worker_type,
+            super::PolicySelectionContext {
+                kv_router_config: &self.kv_router_config,
+                worker_type: self.worker_type,
+                block_size,
+            },
             WorkerSelectionPolicyStateRef::Default(&self.picker),
             workers,
             request,
             eligibility,
-            block_size,
-            None,
-        )
-    }
-
-    fn select_worker_with_lifecycle(
-        &self,
-        input: WorkerSelectionInput<'_, C>,
-        span: Option<&tracing::Span>,
-        investigation: bool,
-    ) -> Result<WorkerSelectionResult, KvSchedulerError> {
-        let (workers, request, eligibility, block_size) = input.into_configured()?;
-        select_worker_with_policy(
-            &self.kv_router_config,
-            self.worker_type,
-            WorkerSelectionPolicyStateRef::Default(&self.picker),
-            workers,
-            request,
-            eligibility,
-            block_size,
-            span.map(|span| RouterSelectionTelemetry::new(span, investigation)),
+            telemetry,
         )
     }
 }
@@ -1172,6 +1178,41 @@ mod tests {
             result,
             Err(KvSchedulerError::PinnedWorkerOverloaded { worker_id: 0 })
         ));
+    }
+
+    #[test]
+    fn test_pinned_worker_evidence_ignores_preferred_taint_multiplier() {
+        let selector = DefaultWorkerSelector::new(Some(KvRouterConfig::default()), "test");
+        let pinned = WorkerWithDpRank::from_worker_id(10);
+        let workers = HashMap::from([(
+            pinned.worker_id,
+            TaintedWorkerConfig {
+                taints: HashSet::from(["mdc-a".to_string()]),
+            },
+        )]);
+        let mut request = base_request(16);
+        request.pinned_worker = Some(pinned);
+        request.routing_constraints.preferred_taints = HashMap::from([("mdc-a".to_string(), 0.5)]);
+        let weights = selection_weights(&selector.kv_router_config, &request);
+        let input = MaterializedSelectionInput::new(&request, 16, weights);
+        let scorer = DefaultWorkerScorer {
+            kv_router_config: &selector.kv_router_config,
+            worker_type: selector.worker_type,
+        };
+
+        let candidates = collect_default_candidate_scores(
+            &scorer,
+            &input,
+            &workers,
+            &request,
+            request.eligibility(),
+        );
+
+        assert_eq!(candidates.len(), 1);
+        let (worker, score) = candidates[0];
+        assert_eq!(worker, pinned);
+        assert_eq!(score.preferred_taint_multiplier, 1.0);
+        assert_eq!(score.cost, score.base_cost);
     }
 
     #[test]

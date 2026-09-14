@@ -523,7 +523,9 @@ where
             staged_kv,
             "kv.dispatch",
             budget,
-            dispatch.instrument(route_span.clone()).instrument(request_dispatch.clone()),
+            dispatch
+                .instrument(route_span.clone())
+                .instrument(request_dispatch.clone()),
         )
         .await
         .and_then(|result| result);

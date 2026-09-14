@@ -396,20 +396,22 @@ where
                 staged_kv,
                 "builtin.dispatch_direct",
                 &budget,
-                self.inner.direct_within_prepared(
-                    request,
-                    target.worker_id,
-                    None,
-                    |request, worker_id| {
-                        let occupancy = guard.retarget_worker(worker_id);
-                        let target = AffinityTarget::new(
-                            worker_id,
-                            target.dp_rank.filter(|_| worker_id == target.worker_id),
-                        );
-                        request.routing_mut().dp_rank = target.dp_rank;
-                        prepare(request, target).map(|metadata| (metadata, target, occupancy))
-                    },
-                ).instrument(request_dispatch.clone()),
+                self.inner
+                    .direct_within_prepared(
+                        request,
+                        target.worker_id,
+                        None,
+                        |request, worker_id| {
+                            let occupancy = guard.retarget_worker(worker_id);
+                            let target = AffinityTarget::new(
+                                worker_id,
+                                target.dp_rank.filter(|_| worker_id == target.worker_id),
+                            );
+                            request.routing_mut().dp_rank = target.dp_rank;
+                            prepare(request, target).map(|metadata| (metadata, target, occupancy))
+                        },
+                    )
+                    .instrument(request_dispatch.clone()),
             )
             .await
             .and_then(|result| result)
@@ -431,7 +433,9 @@ where
                 staged_kv,
                 "builtin.dispatch_exact",
                 &budget,
-                self.inner.dispatch_exact(request, target.worker_id).instrument(request_dispatch.clone()),
+                self.inner
+                    .dispatch_exact(request, target.worker_id)
+                    .instrument(request_dispatch.clone()),
             )
             .await
             .and_then(|result| result)
@@ -443,10 +447,8 @@ where
                 staged_kv,
                 "builtin.dispatch_occupancy",
                 &budget,
-                self.inner.dispatch_preselected_prepared(
-                    request,
-                    initial_worker,
-                    |request, worker_id| {
+                self.inner
+                    .dispatch_preselected_prepared(request, initial_worker, |request, worker_id| {
                         let occupancy = guard.retarget_worker(worker_id);
                         let target = target_for_worker(worker_id);
                         request.routing_mut().dp_rank = target.dp_rank;
@@ -464,17 +466,19 @@ where
                 staged_kv,
                 "builtin.dispatch",
                 &budget,
-                self.inner.direct_within_prepared(
-                    request,
-                    initial_worker,
-                    lora_fallback.as_ref(),
-                    |request, worker_id| {
-                        let occupancy = guard.retarget_worker(worker_id);
-                        let target = target_for_worker(worker_id);
-                        request.routing_mut().dp_rank = target.dp_rank;
-                        prepare(request, target).map(|metadata| (metadata, target, occupancy))
-                    },
-                ).instrument(request_dispatch.clone()),
+                self.inner
+                    .direct_within_prepared(
+                        request,
+                        initial_worker,
+                        lora_fallback.as_ref(),
+                        |request, worker_id| {
+                            let occupancy = guard.retarget_worker(worker_id);
+                            let target = target_for_worker(worker_id);
+                            request.routing_mut().dp_rank = target.dp_rank;
+                            prepare(request, target).map(|metadata| (metadata, target, occupancy))
+                        },
+                    )
+                    .instrument(request_dispatch.clone()),
             )
             .await
             .and_then(|result| result)

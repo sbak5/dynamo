@@ -6312,6 +6312,19 @@ mod tests {
     }
 
     #[test]
+    fn test_overload_response_is_a_rejected_lifecycle_outcome() {
+        let response = ErrorMessage::from_http_error(HttpError {
+            code: overload_status_code().as_u16(),
+            message: "site overloaded".to_string(),
+        });
+
+        assert_eq!(
+            terminal_outcome_for_error_response(&response),
+            TerminalOutcome::Rejected
+        );
+    }
+
+    #[test]
     fn test_from_http_error_rejects_out_of_range_code() {
         // Codes outside the HTTP status space fall back to a sanitized 500.
         let err = HttpError {

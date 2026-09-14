@@ -6,9 +6,11 @@ use std::collections::HashMap;
 use std::ops::BitOr;
 
 use super::{
-    DefaultWorkerPicker, LogitWeights, MaterializedSelectionInput, WorkerSelectionInput,
-    WorkerSelector, select_worker_with_policy,
+    DefaultWorkerPicker, LogitWeights, MaterializedSelectionInput, PolicySelectionContext,
+    WorkerSelectionInput, WorkerSelector, select_worker_with_policy,
 };
+#[cfg(feature = "runtime-protocols")]
+use super::{RouterSelectionTelemetry, current_router_selection_telemetry};
 use crate::protocols::{
     WorkerAffinityTarget, WorkerConfigLike, WorkerId, WorkerSelectionResult, WorkerWithDpRank,
 };
@@ -617,42 +619,25 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for WorkerSelectionPolicy {
                 WorkerSelectionPolicyStateRef::Custom(state)
             }
         };
+        #[cfg(feature = "runtime-protocols")]
+        let telemetry_state = current_router_selection_telemetry();
+        #[cfg(feature = "runtime-protocols")]
+        let telemetry = telemetry_state
+            .as_ref()
+            .map(|(span, investigation)| RouterSelectionTelemetry::new(span, *investigation));
+        #[cfg(not(feature = "runtime-protocols"))]
+        let telemetry = None;
         select_worker_with_policy(
-            &self.kv_router_config,
-            self.worker_label,
+            PolicySelectionContext {
+                kv_router_config: &self.kv_router_config,
+                worker_type: self.worker_label,
+                block_size,
+            },
             state,
             workers,
             request,
             eligibility,
-            block_size,
-            None,
-        )
-    }
-
-    fn select_worker_with_lifecycle(
-        &self,
-        input: WorkerSelectionInput<'_, C>,
-        span: Option<&tracing::Span>,
-        investigation: bool,
-    ) -> Result<WorkerSelectionResult, KvSchedulerError> {
-        let (workers, request, eligibility, block_size) = input.into_configured()?;
-        let state = match &self.state {
-            WorkerSelectionPolicyState::Default(picker) => {
-                WorkerSelectionPolicyStateRef::Default(picker)
-            }
-            WorkerSelectionPolicyState::Custom(state) => {
-                WorkerSelectionPolicyStateRef::Custom(state)
-            }
-        };
-        select_worker_with_policy(
-            &self.kv_router_config,
-            self.worker_label,
-            state,
-            workers,
-            request,
-            eligibility,
-            block_size,
-            span.map(|span| super::RouterSelectionTelemetry::new(span, investigation)),
+            telemetry,
         )
     }
 }

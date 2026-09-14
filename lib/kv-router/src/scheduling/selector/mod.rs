@@ -44,18 +44,6 @@ pub trait WorkerSelector<C: WorkerConfigLike> {
         &self,
         input: WorkerSelectionInput<'_, C>,
     ) -> Result<WorkerSelectionResult, KvSchedulerError>;
-
-    /// Host-only lifecycle hook. Custom selectors keep the ordinary
-    /// `select_worker` contract unless they opt into a decision summary.
-    #[doc(hidden)]
-    fn select_worker_with_lifecycle(
-        &self,
-        input: WorkerSelectionInput<'_, C>,
-        _span: Option<&tracing::Span>,
-        _investigation: bool,
-    ) -> Result<WorkerSelectionResult, KvSchedulerError> {
-        self.select_worker(input)
-    }
 }
 
 /// Inputs supplied by the selector's host.
@@ -300,20 +288,18 @@ impl<'a> RouterSelectionTelemetry<'a> {
             if !detailed
                 .iter()
                 .any(|(worker, _)| *worker == selected_worker)
-            {
-                if let Some(selected) = ranked
+                && let Some(selected) = ranked
                     .iter()
                     .find(|(worker, _)| *worker == selected_worker)
                     .copied()
-                {
-                    detailed.pop();
-                    detailed.push(selected);
-                    detailed.sort_unstable_by(|(left_worker, left), (right_worker, right)| {
-                        left.cost
-                            .total_cmp(&right.cost)
-                            .then_with(|| left_worker.cmp(right_worker))
-                    });
-                }
+            {
+                detailed.pop();
+                detailed.push(selected);
+                detailed.sort_unstable_by(|(left_worker, left), (right_worker, right)| {
+                    left.cost
+                        .total_cmp(&right.cost)
+                        .then_with(|| left_worker.cmp(right_worker))
+                });
             }
             let details = detailed
                 .iter()
@@ -420,6 +406,27 @@ impl<'a> RouterSelectionTelemetry<'a> {
             );
         }
     }
+}
+
+#[cfg(feature = "runtime-protocols")]
+fn current_router_selection_telemetry() -> Option<(tracing::Span, bool)> {
+    use dynamo_runtime::config::{
+        env_is_truthy,
+        environment_names::lifecycle_tracing::{
+            DYN_LIFECYCLE_TRACE_ENABLED, DYN_LIFECYCLE_TRACE_MODE,
+        },
+    };
+
+    let span = tracing::Span::current();
+    let is_router_selection = span.metadata().is_some_and(|metadata| {
+        metadata.target() == dynamo_runtime::telemetry::LIFECYCLE_TARGET
+            && metadata.name() == "router.selection"
+    });
+    (env_is_truthy(DYN_LIFECYCLE_TRACE_ENABLED) && is_router_selection).then(|| {
+        let investigation = std::env::var(DYN_LIFECYCLE_TRACE_MODE)
+            .is_ok_and(|mode| mode.trim().eq_ignore_ascii_case("investigation"));
+        (span, investigation)
+    })
 }
 
 struct MaterializedSelectionInput<'a> {
@@ -641,19 +648,28 @@ fn log_selection<C: WorkerConfigLike>(
     }
 }
 
+pub(super) struct PolicySelectionContext<'a> {
+    pub(super) kv_router_config: &'a KvRouterConfig,
+    pub(super) worker_type: &'static str,
+    pub(super) block_size: u32,
+}
+
 #[inline(always)]
 // DefaultWorkerSelector and SelectionService both converge here. Only the scorer/picker stage is
 // dispatched; eligibility outcomes and result construction stay host-owned and shared.
 fn select_worker_with_policy<C: WorkerConfigLike>(
-    kv_router_config: &KvRouterConfig,
-    worker_type: &'static str,
+    context: PolicySelectionContext<'_>,
     state: WorkerSelectionPolicyStateRef<'_>,
     workers: &HashMap<WorkerId, C>,
     request: &SchedulingRequest,
     eligibility: RoutingEligibility<'_>,
-    block_size: u32,
     telemetry: Option<RouterSelectionTelemetry<'_>>,
 ) -> Result<WorkerSelectionResult, KvSchedulerError> {
+    let PolicySelectionContext {
+        kv_router_config,
+        worker_type,
+        block_size,
+    } = context;
     assert!(request.isl_tokens > 0);
     eligibility.validate_pinned_worker_allowed()?;
 
@@ -686,8 +702,7 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
                 workers,
                 request,
                 eligibility,
-                telemetry,
-                filter_summary,
+                telemetry.zip(filter_summary),
             )
         }
         WorkerSelectionPolicyStateRef::Custom(state) => {

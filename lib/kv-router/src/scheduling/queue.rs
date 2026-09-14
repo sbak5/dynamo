@@ -958,7 +958,10 @@ impl<
         for entry in self.pending.drain() {
             let class_index = entry.class_index();
             let snapshot = entry.snapshot();
-            self.pending_count.fetch_sub(1, AtomicOrdering::Relaxed);
+            let queue_depth_out = self
+                .pending_count
+                .fetch_sub(1, AtomicOrdering::Relaxed)
+                .saturating_sub(1);
             self.pending_isl_tokens
                 .fetch_sub(snapshot.raw_isl_tokens, AtomicOrdering::Relaxed);
             let counters = &class_counters[class_index];
@@ -971,6 +974,9 @@ impl<
                 .fetch_sub(snapshot.cached_tokens, AtomicOrdering::Relaxed);
 
             let queued = entry.into_payload();
+            queued
+                .lifecycle_span
+                .record("dynamo.router.queue.depth.out", queue_depth_out as u64);
             queued
                 .lifecycle_span
                 .record("dynamo.router.queue.outcome", "failed");
@@ -1403,23 +1409,16 @@ impl<
             {
                 eligibility = eligibility.with_affinity_target(target);
             }
-            self.selector
-                .select_worker_with_lifecycle(
-                    WorkerSelectionInput::configured(
-                        &workers,
-                        request,
-                        eligibility,
-                        self.block_size,
-                    ),
-                    #[cfg(feature = "runtime-protocols")]
-                    lifecycle_trace.is_enabled().then_some(&lifecycle_span),
-                    #[cfg(not(feature = "runtime-protocols"))]
-                    None,
-                    #[cfg(feature = "runtime-protocols")]
-                    lifecycle_trace.is_investigation_mode(),
-                    #[cfg(not(feature = "runtime-protocols"))]
-                    false,
-                )
+            lifecycle_span
+                .in_scope(|| {
+                    self.selector
+                        .select_worker(WorkerSelectionInput::configured(
+                            &workers,
+                            request,
+                            eligibility,
+                            self.block_size,
+                        ))
+                })
                 .map(|selection| {
                     let non_max_overlap_selection = if request.mode.is_tracked()
                         && self.non_max_overlap_selection_observer.get().is_some()
