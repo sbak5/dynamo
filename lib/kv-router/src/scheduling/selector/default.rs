@@ -10,9 +10,9 @@ use parking_lot::Mutex;
 
 use super::policy::WorkerSelectionPolicyStateRef;
 use super::{
-    DefaultCandidateScore, LogitWeights, MaterializedSelectionInput, RouterSelectionTelemetry,
-    WorkerCandidate, WorkerInputs,
-    WorkerSelectionContext, WorkerSelectionInput, WorkerSelector, select_worker_with_policy,
+    CandidateFilterSummary, DefaultCandidateScore, LogitWeights, MaterializedSelectionInput,
+    RouterSelectionTelemetry, WorkerCandidate, WorkerInputs, WorkerSelectionContext, WorkerSelectionInput, WorkerSelector,
+    select_worker_with_policy,
 };
 use crate::protocols::{WorkerConfigLike, WorkerId, WorkerSelectionResult, WorkerWithDpRank};
 use crate::scheduling::config::KvRouterConfig;
@@ -350,10 +350,7 @@ impl<C: Borrow<KvRouterConfig>> DefaultWorkerScorer<C> {
                 disk_overlap_blocks: cache.disk_overlap_blocks,
                 shared_blocks_beyond: shared_beyond_device_blocks,
                 active_prefill_tokens: load.active_prefill_tokens,
-                active_decode_blocks: context
-                    .request
-                    .worker_load_for(worker)
-                    .active_decode_blocks,
+                active_decode_blocks: context.request.worker_load_for(worker).active_decode_blocks,
             };
         }
 
@@ -413,10 +410,7 @@ impl<C: Borrow<KvRouterConfig>> DefaultWorkerScorer<C> {
             disk_overlap_blocks: cache.disk_overlap_blocks,
             shared_blocks_beyond: shared_beyond_device_blocks,
             active_prefill_tokens: load.active_prefill_tokens,
-            active_decode_blocks: context
-                .request
-                .worker_load_for(worker)
-                .active_decode_blocks,
+            active_decode_blocks: context.request.worker_load_for(worker).active_decode_blocks,
         }
     }
 
@@ -580,15 +574,9 @@ pub(super) fn pick_default_worker<C: WorkerConfigLike>(
     request: &SchedulingRequest,
     eligibility: RoutingEligibility<'_>,
     telemetry: Option<RouterSelectionTelemetry<'_>>,
+    filter_summary: Option<CandidateFilterSummary>,
 ) -> Option<(WorkerWithDpRank, f64)> {
-    let selected = pick_default_worker_inner(
-        scorer,
-        picker,
-        input,
-        workers,
-        request,
-        eligibility,
-    );
+    let selected = pick_default_worker_inner(scorer, picker, input, workers, request, eligibility);
     let (selected_worker, _) = selected?;
     let Some(telemetry) = telemetry else {
         return selected;
@@ -602,7 +590,8 @@ pub(super) fn pick_default_worker<C: WorkerConfigLike>(
             .routing_constraints
             .preferred_taint_multiplier(config.taints());
         let row = default_row(input, default_context, worker, multiplier);
-        let mut score = scorer.worker_score(&input.context, default_context, &row, "Telemetry formula");
+        let mut score =
+            scorer.worker_score(&input.context, default_context, &row, "Telemetry formula");
         if let Some(multiplier) = multiplier {
             score.preferred_taint_multiplier = multiplier;
             score.cost *= multiplier;
@@ -614,7 +603,8 @@ pub(super) fn pick_default_worker<C: WorkerConfigLike>(
             collect(pinned, config);
         }
     } else {
-        eligibility.for_each_eligible_worker_rank(workers, |worker, config| collect(worker, config));
+        eligibility
+            .for_each_eligible_worker_rank(workers, |worker, config| collect(worker, config));
     }
     let selected_score = candidates
         .iter()
@@ -623,6 +613,7 @@ pub(super) fn pick_default_worker<C: WorkerConfigLike>(
         .expect("selected worker must be among eligible candidates");
     telemetry.record_kv_aware(
         &candidates,
+        filter_summary.expect("telemetry includes candidate accounting"),
         selected_worker,
         selected_score,
         scorer.worker_type,
@@ -656,7 +647,6 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
         &self,
         input: WorkerSelectionInput<'_, C>,
     ) -> Result<WorkerSelectionResult, KvSchedulerError> {
-        let telemetry = input.telemetry();
         let (workers, request, eligibility, block_size) = input.into_configured()?;
         select_worker_with_policy(
             &self.kv_router_config,
@@ -666,7 +656,26 @@ impl<C: WorkerConfigLike> WorkerSelector<C> for DefaultWorkerSelector {
             request,
             eligibility,
             block_size,
-            telemetry,
+            None,
+        )
+    }
+
+    fn select_worker_with_lifecycle(
+        &self,
+        input: WorkerSelectionInput<'_, C>,
+        span: Option<&tracing::Span>,
+        investigation: bool,
+    ) -> Result<WorkerSelectionResult, KvSchedulerError> {
+        let (workers, request, eligibility, block_size) = input.into_configured()?;
+        select_worker_with_policy(
+            &self.kv_router_config,
+            self.worker_type,
+            WorkerSelectionPolicyStateRef::Default(&self.picker),
+            workers,
+            request,
+            eligibility,
+            block_size,
+            span.map(|span| RouterSelectionTelemetry::new(span, investigation)),
         )
     }
 }

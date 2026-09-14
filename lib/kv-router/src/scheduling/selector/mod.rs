@@ -44,6 +44,18 @@ pub trait WorkerSelector<C: WorkerConfigLike> {
         &self,
         input: WorkerSelectionInput<'_, C>,
     ) -> Result<WorkerSelectionResult, KvSchedulerError>;
+
+    /// Host-only lifecycle hook. Custom selectors keep the ordinary
+    /// `select_worker` contract unless they opt into a decision summary.
+    #[doc(hidden)]
+    fn select_worker_with_lifecycle(
+        &self,
+        input: WorkerSelectionInput<'_, C>,
+        _span: Option<&tracing::Span>,
+        _investigation: bool,
+    ) -> Result<WorkerSelectionResult, KvSchedulerError> {
+        self.select_worker(input)
+    }
 }
 
 /// Inputs supplied by the selector's host.
@@ -54,7 +66,6 @@ pub enum WorkerSelectionInput<'a, C: WorkerConfigLike> {
         request: &'a SchedulingRequest,
         eligibility: RoutingEligibility<'a>,
         block_size: u32,
-        telemetry: Option<RouterSelectionTelemetry<'a>>,
     },
     Hosted {
         worker_ids: &'a [WorkerId],
@@ -83,7 +94,6 @@ impl<'a, C: WorkerConfigLike> WorkerSelectionInput<'a, C> {
             request,
             eligibility,
             block_size,
-            telemetry: None,
         }
     }
 
@@ -104,31 +114,11 @@ impl<'a, C: WorkerConfigLike> WorkerSelectionInput<'a, C> {
                 request,
                 eligibility,
                 block_size,
-                ..
             } => Ok((workers, request, eligibility, block_size)),
             Self::Hosted { .. } => Err(WorkerSelectionPolicyError::failed(
                 "selector requires configured worker inputs",
             )
             .into()),
-        }
-    }
-
-    /// Attach a request-lifecycle recorder without widening the public policy API.
-    pub(crate) fn with_telemetry(mut self, telemetry: Option<RouterSelectionTelemetry<'a>>) -> Self {
-        if let Self::Configured {
-            telemetry: input_telemetry,
-            ..
-        } = &mut self
-        {
-            *input_telemetry = telemetry;
-        }
-        self
-    }
-
-    fn telemetry(&self) -> Option<RouterSelectionTelemetry<'a>> {
-        match self {
-            Self::Configured { telemetry, .. } => *telemetry,
-            Self::Hosted { .. } => None,
         }
     }
 
@@ -174,6 +164,68 @@ struct DefaultCandidateScore {
     active_decode_blocks: usize,
 }
 
+/// Host-owned accounting for the DP-rank candidate universe. These fields are
+/// policy-neutral and stay meaningful when a custom policy is installed.
+#[derive(Debug, Clone, Copy, Default)]
+struct CandidateFilterSummary {
+    eligible: usize,
+    not_allowed: usize,
+    constraints: usize,
+    overloaded: usize,
+    unavailable: usize,
+}
+
+impl CandidateFilterSummary {
+    fn count_worker<C: WorkerConfigLike>(
+        &mut self,
+        worker_id: WorkerId,
+        config: &C,
+        eligibility: RoutingEligibility<'_>,
+    ) {
+        let replicas = config.data_parallel_size() as usize;
+        if !eligibility.caller_allows_worker_id(worker_id) {
+            self.not_allowed += replicas;
+        } else if !eligibility.is_worker_available(worker_id) {
+            self.unavailable += replicas;
+        } else if !eligibility.allows_worker_ignoring_overload(worker_id, config) {
+            self.constraints += replicas;
+        } else if eligibility.is_worker_overloaded(worker_id) {
+            self.overloaded += replicas;
+        } else {
+            self.eligible += replicas;
+        }
+    }
+
+    fn from_eligibility<C: WorkerConfigLike>(
+        workers: &HashMap<WorkerId, C>,
+        eligibility: RoutingEligibility<'_>,
+    ) -> Self {
+        let mut summary = Self::default();
+        if let Some(worker) = eligibility.pinned_worker() {
+            match workers.get(&worker.worker_id) {
+                Some(config) => {
+                    summary.count_worker(worker.worker_id, config, eligibility);
+                    summary.eligible = usize::from(summary.eligible > 0);
+                    summary.not_allowed = usize::from(summary.not_allowed > 0);
+                    summary.constraints = usize::from(summary.constraints > 0);
+                    summary.overloaded = usize::from(summary.overloaded > 0);
+                    summary.unavailable = usize::from(summary.unavailable > 0);
+                }
+                None => summary.unavailable = 1,
+            }
+            return summary;
+        }
+        for (&worker_id, config) in workers {
+            summary.count_worker(worker_id, config, eligibility);
+        }
+        summary
+    }
+
+    fn filtered_count(self) -> usize {
+        self.not_allowed + self.constraints + self.overloaded + self.unavailable
+    }
+}
+
 /// Bounded decision evidence written to a lifecycle `router.selection` span.
 /// Core mode records a stable summary. Investigation mode additionally records
 /// at most four built-in KV-aware candidate decompositions.
@@ -194,6 +246,7 @@ impl<'a> RouterSelectionTelemetry<'a> {
     fn record_kv_aware(
         self,
         candidates: &[(WorkerWithDpRank, DefaultCandidateScore)],
+        filters: CandidateFilterSummary,
         selected_worker: WorkerWithDpRank,
         selected_score: DefaultCandidateScore,
         pool_role: &'static str,
@@ -213,6 +266,7 @@ impl<'a> RouterSelectionTelemetry<'a> {
 
         self.span
             .record("dynamo.router.candidate.count", candidates.len() as u64);
+        self.record_candidate_envelope(filters);
         self.span.record("dynamo.router.algorithm.id", "kv_aware");
         self.span.record("dynamo.router.algorithm.version", "v1");
         self.span
@@ -240,10 +294,8 @@ impl<'a> RouterSelectionTelemetry<'a> {
 
         if self.include_candidate_details {
             const TOP_K: usize = 4;
-            self.span.record(
-                "dynamo.router.candidates.detail_schema",
-                "kv_aware.v1",
-            );
+            self.span
+                .record("dynamo.router.candidates.detail_schema", "kv_aware.v1");
             let details = ranked
                 .iter()
                 .take(TOP_K)
@@ -271,9 +323,81 @@ impl<'a> RouterSelectionTelemetry<'a> {
                 })
                 .collect::<Vec<_>>()
                 .join(",");
+            self.span
+                .record("dynamo.router.candidates.top_k", format!("[{details}]"));
+        }
+    }
+
+    fn record_candidate_envelope(self, filters: CandidateFilterSummary) {
+        self.span.record(
+            "dynamo.router.candidate.eligible.count",
+            filters.eligible as u64,
+        );
+        self.span.record(
+            "dynamo.router.candidate.filtered.count",
+            filters.filtered_count() as u64,
+        );
+        self.span.record(
+            "dynamo.router.candidate.filtered.not_allowed",
+            filters.not_allowed as u64,
+        );
+        self.span.record(
+            "dynamo.router.candidate.filtered.constraints",
+            filters.constraints as u64,
+        );
+        self.span.record(
+            "dynamo.router.candidate.filtered.overloaded",
+            filters.overloaded as u64,
+        );
+        self.span.record(
+            "dynamo.router.candidate.filtered.unavailable",
+            filters.unavailable as u64,
+        );
+    }
+
+    fn record_custom(
+        self,
+        candidates: &[ScoredWorkerCandidate],
+        filters: CandidateFilterSummary,
+        selected: ScoredWorkerCandidate,
+        pool_role: &'static str,
+    ) {
+        self.span
+            .record("dynamo.router.candidate.count", candidates.len() as u64);
+        self.record_candidate_envelope(filters);
+        self.span.record("dynamo.router.algorithm.id", "custom");
+        self.span.record("dynamo.router.algorithm.version", "v1");
+        self.span
+            .record("dynamo.router.decision.schema", "selection.v1");
+        self.span.record("dynamo.router.selection.policy", "custom");
+        self.span.record("dynamo.router.pool.role", pool_role);
+        self.span.record(
+            "dynamo.router.selected.worker.id",
+            selected.worker.worker_id,
+        );
+        self.span.record(
+            "dynamo.router.selected.dp.rank",
+            selected.worker.dp_rank as u64,
+        );
+        self.span
+            .record("dynamo.router.selected.score", selected.cost);
+        if let Some(best) = candidates.iter().min_by(|left, right| {
+            left.cost
+                .total_cmp(&right.cost)
+                .then_with(|| left.worker.cmp(&right.worker))
+        }) {
+            self.span
+                .record("dynamo.router.best.worker.id", best.worker.worker_id);
+            self.span
+                .record("dynamo.router.best.dp.rank", best.worker.dp_rank as u64);
+            self.span.record("dynamo.router.best.score", best.cost);
+            let runner_up = candidates
+                .iter()
+                .filter(|candidate| candidate.worker != best.worker)
+                .min_by(|left, right| left.cost.total_cmp(&right.cost));
             self.span.record(
-                "dynamo.router.candidates.top_k",
-                format!("[{details}]"),
+                "dynamo.router.best.margin",
+                runner_up.map_or(0.0, |candidate| candidate.cost - best.cost),
             );
         }
     }
@@ -528,6 +652,8 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
 
     let weights = selection_weights(kv_router_config, request);
     let input = MaterializedSelectionInput::new(request, block_size, weights);
+    let filter_summary =
+        telemetry.map(|_| CandidateFilterSummary::from_eligibility(workers, eligibility));
     let selected = match state {
         WorkerSelectionPolicyStateRef::Default(picker) => {
             let scorer = DefaultWorkerScorer {
@@ -542,6 +668,7 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
                 request,
                 eligibility,
                 telemetry,
+                filter_summary,
             )
         }
         WorkerSelectionPolicyStateRef::Custom(state) => {
@@ -587,6 +714,14 @@ fn select_worker_with_policy<C: WorkerConfigLike>(
                     }
                     .into());
                 };
+                if let Some(telemetry) = telemetry {
+                    telemetry.record_custom(
+                        candidates,
+                        filter_summary.expect("telemetry includes candidate accounting"),
+                        *candidate,
+                        worker_type,
+                    );
+                }
                 Some((candidate.worker, candidate.cost))
             }
         }
